@@ -1,12 +1,14 @@
+import json
+import os
 from flask import Blueprint, request, jsonify
 
 webhook_bp = Blueprint('webhook', __name__)
 
-@webhook_bp.route('/webhook', methods=['POST'])  # <-- make sure this matches your ngrok URL
+@webhook_bp.route('/webhook', methods=['POST'])
 def webhook():
     try:
         req = request.get_json(force=True)
-        print("Received JSON:", req)  # Log to terminal
+        print("Received JSON:", req)
 
         intent = req.get('queryResult', {}).get('intent', {}).get('displayName', '')
 
@@ -19,9 +21,33 @@ def webhook():
 
         elif intent == "Book Appointment":
             parameters = req.get('queryResult', {}).get('parameters', {})
+            print("Booking appointment with parameters:", parameters)
             name = parameters.get('name', 'the patient')
             date = parameters.get('date', 'a suitable date')
             time = parameters.get('time', 'a suitable time')
+
+            appointment = {
+                "name": name,
+                "date": date,
+                "time": time
+            }
+
+            file_path = os.path.join(os.path.dirname(__file__), 'appointments.json')
+
+            # Load existing appointments safely
+            appointments = []
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r') as f:
+                        appointments = json.load(f)
+                except json.JSONDecodeError:
+                    print("Warning: appointments.json is empty or invalid, starting fresh.")
+                    appointments = []
+
+            appointments.append(appointment)
+            with open(file_path, 'w') as f:
+                json.dump(appointments, f, indent=2)
+
             response = f"Appointment booked for {name} on {date} at {time}."
 
         else:
