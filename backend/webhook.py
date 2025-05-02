@@ -58,3 +58,20 @@ def webhook():
     except Exception as e:
         print("Webhook error:", str(e))
         return jsonify({'fulfillmentText': "Oops, something went wrong on the server."})
+
+
+# ✅ New route to fetch all appointments
+@webhook_bp.route('/appointments', methods=['GET'])
+def get_appointments():
+    file_path = os.path.join(os.path.dirname(__file__), 'appointments.json')
+
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                appointments = json.load(f)
+        except json.JSONDecodeError:
+            appointments = []
+    else:
+        appointments = []
+
+    return jsonify(appointments)
