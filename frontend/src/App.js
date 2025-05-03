@@ -1,5 +1,5 @@
 import React from 'react';
-import ChatWindow from './components/ChatWindow';
+import Chatbot from './components/Chatbot'; // Corrected component name
 import './App.css';
 
 function App() {
@@ -7,7 +7,7 @@ function App() {
     <div className="App bg-light min-vh-100">
       <div className="container py-5">
         <h2 className="text-center mb-4">💬 Healthcare Chatbot</h2>
-        <ChatWindow />
+        <Chatbot /> {/* Use the correct component here */}
       </div>
     </div>
   );

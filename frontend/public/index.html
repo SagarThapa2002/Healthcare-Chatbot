@@ -8,6 +8,7 @@
   <style>
     body {
       background-color: #f8f9fa;
+      font-family: 'Segoe UI', sans-serif;
     }
     .chat-container {
       max-width: 600px;
@@ -26,26 +27,75 @@
     }
     .message {
       margin-bottom: 15px;
-      padding: 10px;
-      border-radius: 10px;
+      padding: 10px 15px;
+      border-radius: 20px;
       max-width: 75%;
       word-wrap: break-word;
+      display: flex;
+      align-items: flex-end;
+      animation: fadeIn 0.3s ease;
     }
     .user-message {
       background-color: #d1e7dd;
       align-self: flex-end;
+      flex-direction: row-reverse;
     }
     .bot-message {
       background-color: #e2e3e5;
       align-self: flex-start;
     }
+    .avatar {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      margin: 0 10px;
+    }
+    .spinner-border {
+      width: 1rem;
+      height: 1rem;
+    }
+    .typing {
+      display: flex;
+      gap: 5px;
+      margin-left: 10px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      background-color: #6c757d;
+      border-radius: 50%;
+      animation: blink 1.5s infinite ease-in-out;
+    }
+    .dot:nth-child(2) { animation-delay: 0.2s; }
+    .dot:nth-child(3) { animation-delay: 0.4s; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes blink {
+      0%, 80%, 100% { opacity: 0.3; }
+      40% { opacity: 1; }
+    }
+
+    @media (max-width: 576px) {
+      .chat-container {
+        margin: 20px 10px;
+        height: 90vh;
+      }
+      .message {
+        font-size: 0.9rem;
+      }
+    }
   </style>
 </head>
 <body>
 
-<div id="root">
-  <div class="bg-primary text-white text-center p-3 rounded-top">
-    <h5>Healthcare Chatbot</h5>
+<div class="chat-container">
+  <div class="bg-primary text-white text-center p-3 rounded-top d-flex align-items-center justify-content-center">
+    <img src="https://img.icons8.com/ios/50/ffffff/stethoscope.png" width="30" class="me-2"/>
+    <h5 class="mb-0">Healthcare Chatbot</h5>
   </div>
 
   <div class="chat-messages d-flex flex-column" id="chat">
@@ -54,7 +104,10 @@
 
   <form class="d-flex p-3 border-top" id="chat-form">
     <input type="text" class="form-control me-2" id="user-input" placeholder="Type a message..." required />
-    <button class="btn btn-primary" type="submit">Send</button>
+    <button class="btn btn-primary d-flex align-items-center" type="submit" id="send-btn">
+      <span>Send</span>
+      <div class="spinner-border text-light ms-2 d-none" role="status" id="loading-spinner"></div>
+    </button>
   </form>
 </div>
 
@@ -62,13 +115,49 @@
   const chat = document.getElementById('chat');
   const form = document.getElementById('chat-form');
   const userInput = document.getElementById('user-input');
+  const spinner = document.getElementById('loading-spinner');
 
   function appendMessage(content, sender = 'bot') {
     const msgDiv = document.createElement('div');
     msgDiv.classList.add('message', sender === 'user' ? 'user-message' : 'bot-message');
-    msgDiv.innerText = content;
+
+    const avatar = document.createElement('img');
+    avatar.className = 'avatar';
+    avatar.src = sender === 'user'
+      ? 'https://img.icons8.com/color/48/user.png'
+      : 'https://img.icons8.com/color/48/robot.png';
+
+    const text = document.createElement('div');
+    text.innerText = content;
+
+    msgDiv.appendChild(avatar);
+    msgDiv.appendChild(text);
     chat.appendChild(msgDiv);
     chat.scrollTop = chat.scrollHeight;
+  }
+
+  function showTypingIndicator() {
+    const typingDiv = document.createElement('div');
+    typingDiv.classList.add('message', 'bot-message');
+    typingDiv.id = 'typing-indicator';
+
+    const avatar = document.createElement('img');
+    avatar.className = 'avatar';
+    avatar.src = 'https://img.icons8.com/color/48/robot.png';
+
+    const dots = document.createElement('div');
+    dots.className = 'typing';
+    dots.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
+
+    typingDiv.appendChild(avatar);
+    typingDiv.appendChild(dots);
+    chat.appendChild(typingDiv);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function removeTypingIndicator() {
+    const typing = document.getElementById('typing-indicator');
+    if (typing) typing.remove();
   }
 
   form.addEventListener('submit', async (e) => {
@@ -78,6 +167,8 @@
 
     appendMessage(message, 'user');
     userInput.value = '';
+    spinner.classList.remove('d-none');
+    showTypingIndicator();
 
     try {
       const response = await fetch('/webhook/webhook', {
@@ -85,16 +176,20 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           queryResult: {
-            intent: { displayName: "General FAQ" },  // For now, sending a static intent
+            intent: { displayName: "General FAQ" },
             parameters: { user_message: message }
           }
         })
       });
 
       const data = await response.json();
+      removeTypingIndicator();
+      spinner.classList.add('d-none');
       appendMessage(data.fulfillmentText || "Sorry, I didn't understand that.");
     } catch (err) {
       console.error(err);
+      removeTypingIndicator();
+      spinner.classList.add('d-none');
       appendMessage("There was an error connecting to the server.");
     }
   });
