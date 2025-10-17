@@ -5,12 +5,11 @@ A Dialogflow-integrated chatbot system that provides basic symptom checks and al
 ---
 
 ## 📘 Final Year Project – CN6000  
-**University of East London**
+****
 
 **Created by:** Sagar Thapa  
 **Module:** CN6000 - Final Year Project  
-**Supervisor:** *[Add your supervisor's name]*  
-**Academic Year:** 2024/2025
+
 
 ---
 
