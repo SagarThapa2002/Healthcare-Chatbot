@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import MessageList from './MessageList';
+import { getMessageText } from './MessageBubble';
 import EmptyState from './EmptyState';
 import TypingIndicator from './TypingIndicator';
 import ChatComposer from './ChatComposer';
@@ -46,7 +47,7 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
   const latestAssistantText = (() => {
     if (isTyping) return '';
     for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i].sender === 'bot') return messages[i].text;
+      if (messages[i].sender === 'bot') return getMessageText(messages[i]);
     }
     return '';
   })();

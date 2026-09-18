@@ -12,7 +12,7 @@ describe('ChatPanel', () => {
   test('renders existing messages instead of the empty state', () => {
     const messages = [
       { sender: 'user', text: 'Hello' },
-      { sender: 'bot', text: 'Hi, how can I help?' },
+      { sender: 'bot', type: 'text', content: { text: 'Hi, how can I help?' }, suggestions: [] },
     ];
     render(
       <ChatPanel

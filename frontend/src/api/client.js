@@ -1,3 +1,5 @@
+import { normalizeResponse } from './normalizeResponse';
+
 async function callBackend(intent, parameters) {
   const response = await fetch('http://127.0.0.1:5000/webhook/webhook', {
     method: 'POST',
@@ -5,7 +7,7 @@ async function callBackend(intent, parameters) {
     body: JSON.stringify({ queryResult: { intent: { displayName: intent }, parameters } }),
   });
   const data = await response.json();
-  return data.fulfillmentText;
+  return normalizeResponse(data);
 }
 
 export { callBackend };

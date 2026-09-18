@@ -10,11 +10,46 @@ import {
 } from '../conversation/booking';
 import { callBackend } from '../api/client';
 
+// Prefixes the display text of an envelope's first message, leaving every
+// other field (type, suggestions, context, meta, success, error) untouched.
+// Used only for the "switched task while a booking was pending" case below.
+function prefixFirstMessage(envelope, prefix) {
+  if (envelope.messages.length === 0) return envelope;
+  const [first, ...rest] = envelope.messages;
+  return {
+    ...envelope,
+    messages: [
+      { ...first, content: { ...first.content, text: `${prefix}${first.content.text}` } },
+      ...rest,
+    ],
+  };
+}
+
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [booking, setBooking] = useState(EMPTY_BOOKING);
+
+  // For plain client-side prompts (validation messages, etc.) that never
+  // went through the backend, so they render with the same shape as a
+  // real structured message.
+  const sayText = (text) =>
+    setMessages(prev => [...prev, { sender: 'bot', type: 'text', content: { text }, suggestions: [] }]);
+
+  // For a normalized backend envelope (see api/normalizeResponse.js):
+  // appends one bot message per entry in envelope.messages, or a single
+  // fallback message using the envelope's own error text if the backend
+  // reported a genuine failure (messages: []).
+  const sayEnvelope = (envelope) => {
+    const toShow = envelope.messages.length > 0
+      ? envelope.messages
+      : [{ type: 'text', content: { text: envelope.error?.message || 'Sorry, an error occurred.' }, suggestions: [] }];
+    setMessages(prev => [
+      ...prev,
+      ...toShow.map((m) => ({ sender: 'bot', type: m.type, content: m.content, suggestions: m.suggestions })),
+    ]);
+  };
 
   const sendMessage = async (e) => {
     e.preventDefault();
@@ -25,8 +60,6 @@ function useConversation() {
     setUserInput('');
     setIsTyping(true);
 
-    const say = (botText) => setMessages(prev => [...prev, { sender: 'bot', text: botText }]);
-
     try {
       const stage = bookingStage(booking);
 
@@ -34,12 +67,12 @@ function useConversation() {
         const answer = text.trim().toLowerCase();
 
         if (stage === 'confirm' && answer === 'yes') {
-          say(await callBackend('YesIntent', {}));
+          sayEnvelope(await callBackend('YesIntent', {}));
           setBooking(EMPTY_BOOKING);
           return;
         }
         if (stage === 'confirm' && answer === 'no') {
-          say(await callBackend('NoIntent', {}));
+          sayEnvelope(await callBackend('NoIntent', {}));
           setBooking(EMPTY_BOOKING);
           return;
         }
@@ -50,48 +83,48 @@ function useConversation() {
         if (INTERRUPTION_INTENTS.includes(otherIntent)) {
           setBooking(EMPTY_BOOKING);
           const parameters = otherIntent === 'Symptom Check' ? { symptom: text } : {};
-          const reply = await callBackend(otherIntent, parameters);
-          say(`(Cancelled your in-progress booking.) ${reply}`);
+          const envelope = await callBackend(otherIntent, parameters);
+          sayEnvelope(prefixFirstMessage(envelope, '(Cancelled your in-progress booking.) '));
           return;
         }
 
         if (stage === 'name') {
           if (!isValidName(text)) {
-            say("That doesn't look like a name - could you tell me your name?");
+            sayText("That doesn't look like a name - could you tell me your name?");
             return;
           }
           const next = { ...booking, name: text.trim() };
           setBooking(next);
-          say(await callBackend('Book Appointment', bookingParams(next)));
+          sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
           return;
         }
 
         if (stage === 'date') {
           const date = parseDate(text);
           if (!date) {
-            say('I couldn\'t understand that date. Try a format like 2026-12-26, 26-12-2026, or "26 December 2026".');
+            sayText('I couldn\'t understand that date. Try a format like 2026-12-26, 26-12-2026, or "26 December 2026".');
             return;
           }
           const next = { ...booking, date };
           setBooking(next);
-          say(await callBackend('Book Appointment', bookingParams(next)));
+          sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
           return;
         }
 
         if (stage === 'time') {
           const time = parseTime(text);
           if (!time) {
-            say('I couldn\'t understand that time. Try a format like 10:00, 10:30am, or 2pm.');
+            sayText('I couldn\'t understand that time. Try a format like 10:00, 10:30am, or 2pm.');
             return;
           }
           const next = { ...booking, time };
           setBooking(next);
-          say(await callBackend('Book Appointment', bookingParams(next)));
+          sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
           return;
         }
 
         // stage === 'confirm', but the answer wasn't yes/no/an interruption.
-        say('Please reply "yes" to confirm the appointment, or "no" to cancel it.');
+        sayText('Please reply "yes" to confirm the appointment, or "no" to cancel it.');
         return;
       }
 
@@ -101,14 +134,14 @@ function useConversation() {
         const fields = extractInitialBookingFields(text);
         const next = { active: true, name: fields.name || null, date: fields.date || null, time: fields.time || null };
         setBooking(next);
-        say(await callBackend('Book Appointment', bookingParams(next)));
+        sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
       } else {
         const parameters = intent === 'Symptom Check' ? { symptom: text } : {};
-        say(await callBackend(intent, parameters));
+        sayEnvelope(await callBackend(intent, parameters));
       }
     } catch (err) {
       console.error(err);
-      say('Sorry, an error occurred.');
+      sayText('Sorry, an error occurred.');
     } finally {
       setIsTyping(false);
     }
