@@ -1,0 +1,11 @@
+{
+  "displayName": "NoIntent",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "no",
+    "no thanks",
+    "nope",
+    "cancel that"
+  ],
+  "parameters": []
+}

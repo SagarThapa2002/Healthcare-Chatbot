@@ -1,0 +1,6 @@
+{
+  "displayName": "Healthcare Chatbot (hand-authored scaffold)",
+  "description": "Hand-authored Dialogflow ES agent scaffold reflecting the intent/parameter contract already implemented in backend/chatbot_logic.py. This is NOT an export from a live Dialogflow agent - see dialogflow/README.md before using it for anything.",
+  "language": "en",
+  "timeZone": "Etc/UTC"
+}

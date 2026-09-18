@@ -1,0 +1,17 @@
+{
+  "displayName": "Cancel Appointment",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "cancel my appointment",
+    "cancel appointment for Sagar",
+    "I want to cancel my booking"
+  ],
+  "parameters": [
+    {
+      "name": "name",
+      "entityType": "@sys.person",
+      "isList": false,
+      "required": false
+    }
+  ]
+}

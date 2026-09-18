@@ -1,0 +1,11 @@
+{
+  "displayName": "General FAQ",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "hi",
+    "hello",
+    "what can you help with",
+    "help"
+  ],
+  "parameters": []
+}

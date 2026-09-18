@@ -1,0 +1,19 @@
+{
+  "displayName": "Symptom Check",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "I have a headache",
+    "I'm feeling dizzy",
+    "I have a fever",
+    "My stomach hurts",
+    "I have a cough"
+  ],
+  "parameters": [
+    {
+      "name": "symptom",
+      "entityType": "@sys.any",
+      "isList": false,
+      "required": false
+    }
+  ]
+}

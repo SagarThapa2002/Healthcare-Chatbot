@@ -1,6 +1,6 @@
 # 🏥 Healthcare Chatbot for Primary Care and Appointment Scheduling
 
-A Dialogflow-integrated chatbot system that provides basic symptom checks and allows patients to book appointments using natural language.
+A healthcare chatbot system that provides basic symptom checks and allows patients to book appointments using natural language. Intent detection currently happens directly in the React frontend; the Flask backend's webhook contract mirrors the Dialogflow ES fulfillment format but Dialogflow itself is not wired in at runtime. See `dialogflow/README.md` for a hand-authored Dialogflow ES scaffold matching that contract.
 
 ---
 
@@ -19,7 +19,7 @@ This project demonstrates a healthcare chatbot that:
 
 - Accepts symptom-related queries and provides basic advice
 - Enables patients to book an appointment with a doctor
-- Uses Dialogflow ES for natural language understanding
+- Performs intent detection in the frontend via keyword/pattern matching (`frontend/src/conversation/intent.js`); the backend webhook contract mirrors the Dialogflow ES fulfillment format, but Dialogflow is not currently wired in at runtime (see `dialogflow/README.md`)
 - Has a Flask-based backend for webhook logic
 - Stores booked appointments in a local JSON file
 - Exposes an API endpoint to view all booked appointments
@@ -46,10 +46,10 @@ This project demonstrates a healthcare chatbot that:
 
 ## ⚙️ Technologies Used
 
-- **Dialogflow ES**
+- **Dialogflow ES** – webhook contract only (see `dialogflow/README.md`); not wired in at runtime
 - **Python 3**
 - **Flask**
-- **Ngrok** – for tunneling localhost to Dialogflow
+- **Ngrok** – previously used for tunneling localhost to a live Dialogflow agent; not required for the current setup
 - **Git/GitHub** – for version control
 
 ---

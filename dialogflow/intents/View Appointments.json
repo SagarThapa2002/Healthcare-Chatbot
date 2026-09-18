@@ -1,0 +1,10 @@
+{
+  "displayName": "View Appointments",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "view my appointments",
+    "show me my appointments",
+    "what appointments do I have"
+  ],
+  "parameters": []
+}

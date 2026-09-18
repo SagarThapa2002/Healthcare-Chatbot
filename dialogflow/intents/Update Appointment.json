@@ -1,0 +1,29 @@
+{
+  "displayName": "Update Appointment",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "update my appointment",
+    "I want to change my appointment date",
+    "update appointment for Sagar"
+  ],
+  "parameters": [
+    {
+      "name": "name",
+      "entityType": "@sys.person",
+      "isList": false,
+      "required": false
+    },
+    {
+      "name": "date",
+      "entityType": "@sys.date",
+      "isList": false,
+      "required": false
+    },
+    {
+      "name": "time",
+      "entityType": "@sys.time",
+      "isList": false,
+      "required": false
+    }
+  ]
+}

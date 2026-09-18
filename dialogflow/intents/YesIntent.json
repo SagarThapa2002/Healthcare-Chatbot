@@ -1,0 +1,11 @@
+{
+  "displayName": "YesIntent",
+  "webhookUsed": true,
+  "trainingPhrases": [
+    "yes",
+    "yes please",
+    "yeah",
+    "confirm it"
+  ],
+  "parameters": []
+}
