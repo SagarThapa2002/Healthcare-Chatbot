@@ -138,7 +138,12 @@ def _handle_no_intent():
 
 
 def _handle_update_appointment(parameters):
-    name = parameters.get('name')
+    name = (parameters or {}).get('name')
+    if not name:
+        return [response_model.text_message(
+            "Sure - what's the name on the appointment you'd like to update?"
+        )]
+
     new_date = parameters.get('date')
     new_time = parameters.get('time')
 
@@ -167,7 +172,11 @@ def _handle_update_appointment(parameters):
 
 
 def _handle_cancel_appointment(parameters):
-    name = parameters.get('name')
+    name = (parameters or {}).get('name')
+    if not name:
+        return [response_model.text_message(
+            "Sure - what's the name on the appointment you'd like to cancel?"
+        )]
 
     if os.path.exists(APPOINTMENTS_FILE):
         appointments = _read_appointments_raw()

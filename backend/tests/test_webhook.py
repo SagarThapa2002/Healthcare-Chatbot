@@ -114,5 +114,141 @@ class WebhookTestCase(unittest.TestCase):
         self.assertEqual(data["meta"]["schemaVersion"], "1.0")
 
 
+class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
+    """Regression tests for a real, verified bug: the frontend's single-shot
+    routing for Update/Cancel Appointment sends {} as parameters (pinned in
+    frontend/src/hooks/useConversation.test.js), which used to make
+    chatbot_logic._handle_update_appointment / _handle_cancel_appointment
+    crash with AttributeError('NoneType' object has no attribute 'lower')
+    as soon as name.lower() ran against a None name - whenever the
+    appointments file was non-empty. Every test here seeds a real
+    appointment first (via the same Book Appointment -> YesIntent flow used
+    elsewhere in this file) specifically to exercise that non-empty case.
+
+    Deliberately does NOT subclass WebhookTestCase above: that class already
+    has its own real tests, and subclassing a TestCase that carries test_*
+    methods makes unittest's discovery inherit and silently re-run them a
+    second time under this class's name too. Duplicating the small
+    setUp/post_webhook helper here keeps this class's discovered test count
+    equal to the number of test_ methods actually defined below - matching
+    the existing LLMRoutingTestCase base-with-no-tests-of-its-own pattern in
+    test_chatbot_logic_llm_routing.py.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+
+        self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
+        self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
+
+        patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
+        patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_appointments.start()
+        patcher_pending.start()
+        self.addCleanup(patcher_appointments.stop)
+        self.addCleanup(patcher_pending.stop)
+
+        self.client = app.test_client()
+
+    def post_webhook(self, intent, parameters=None):
+        body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
+        return self.client.post('/webhook/webhook', json=body)
+
+    def _book_and_confirm(self, name="Test Patient", date="2026-12-26", time="10:00"):
+        self.post_webhook("Book Appointment", {"name": name, "date": date, "time": time})
+        self.post_webhook("YesIntent")
+
+    def test_update_appointment_without_name_does_not_crash(self):
+        self._book_and_confirm()
+
+        with patch("backend.chatbot_logic.assistant_service.answer") as mock_answer:
+            response = self.post_webhook("Update Appointment", {})
+        data = response.get_json()
+
+        mock_answer.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(data["success"])
+        self.assertIsNone(data["error"])
+        self.assertEqual(data["messages"][0]["type"], "text")
+        self.assertIn("name", data["messages"][0]["content"]["text"].lower())
+        self.assertEqual(data["context"], {"intent": "Update Appointment"})
+        self.assertEqual(data["meta"]["schemaVersion"], "1.0")
+
+    def test_cancel_appointment_without_name_does_not_crash(self):
+        self._book_and_confirm()
+
+        with patch("backend.chatbot_logic.assistant_service.answer") as mock_answer:
+            response = self.post_webhook("Cancel Appointment", {})
+        data = response.get_json()
+
+        mock_answer.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(data["success"])
+        self.assertIsNone(data["error"])
+        self.assertEqual(data["messages"][0]["type"], "text")
+        self.assertIn("name", data["messages"][0]["content"]["text"].lower())
+        self.assertEqual(data["context"], {"intent": "Cancel Appointment"})
+        self.assertEqual(data["meta"]["schemaVersion"], "1.0")
+
+    def test_update_appointment_without_parameters_key_does_not_crash(self):
+        # queryResult.parameters can be omitted entirely, not just empty -
+        # the handler must guard against a None parameters dict too.
+        self._book_and_confirm()
+
+        body = {"queryResult": {"intent": {"displayName": "Update Appointment"}}}
+        data = self.client.post('/webhook/webhook', json=body).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("name", data["messages"][0]["content"]["text"].lower())
+
+    def test_cancel_appointment_without_parameters_key_does_not_crash(self):
+        self._book_and_confirm()
+
+        body = {"queryResult": {"intent": {"displayName": "Cancel Appointment"}}}
+        data = self.client.post('/webhook/webhook', json=body).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("name", data["messages"][0]["content"]["text"].lower())
+
+    def test_update_appointment_with_valid_name_still_updates(self):
+        self._book_and_confirm()
+
+        data = self.post_webhook(
+            "Update Appointment", {"name": "Test Patient", "date": "2027-01-02"}
+        ).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("has been updated", data["messages"][0]["content"]["text"])
+
+    def test_cancel_appointment_with_valid_name_still_cancels(self):
+        self._book_and_confirm()
+
+        data = self.post_webhook("Cancel Appointment", {"name": "Test Patient"}).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("has been successfully canceled", data["messages"][0]["content"]["text"])
+
+    def test_update_appointment_with_unmatched_name_reports_not_found_not_a_crash(self):
+        self._book_and_confirm()
+
+        data = self.post_webhook(
+            "Update Appointment", {"name": "Nobody Booked This Name", "date": "2027-01-02"}
+        ).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("couldn't find an appointment", data["messages"][0]["content"]["text"])
+
+    def test_cancel_appointment_with_unmatched_name_reports_not_found_not_a_crash(self):
+        self._book_and_confirm()
+
+        data = self.post_webhook(
+            "Cancel Appointment", {"name": "Nobody Booked This Name"}
+        ).get_json()
+
+        self.assertTrue(data["success"])
+        self.assertIn("couldn't find an appointment", data["messages"][0]["content"]["text"])
+
+
 if __name__ == '__main__':
     unittest.main()
