@@ -11,6 +11,8 @@ not "fixed", since fixing them wasn't asked for in this phase.
 import json
 import os
 
+from backend import assistant_service
+from backend import llm_config
 from backend import response_model
 
 APPOINTMENTS_FILE = os.path.join(os.path.dirname(__file__), 'appointments.json')
@@ -56,7 +58,7 @@ def handle_webhook_request(payload):
     elif intent == "View Appointments":
         messages = _handle_view_appointments()
     elif intent == "General FAQ":
-        messages = _handle_general_faq()
+        messages = _handle_general_faq(parameters)
     else:
         messages = [response_model.text_message(
             "Sorry, I didn't understand that. Could you rephrase or ask something else?"
@@ -196,10 +198,41 @@ def _handle_view_appointments():
     return [response_model.text_message(text)]
 
 
-def _handle_general_faq():
-    text = (
-        "Hi! I'm your virtual healthcare assistant. I can help you check symptoms, "
-        "book or cancel appointments, and answer general health-related questions. "
-        "What would you like help with today?"
-    )
-    return [response_model.text_message(text)]
+_GENERAL_FAQ_GREETING = (
+    "Hi! I'm your virtual healthcare assistant. I can help you check symptoms, "
+    "book or cancel appointments, and answer general health-related questions. "
+    "What would you like help with today?"
+)
+
+
+def _handle_general_faq(parameters):
+    """General FAQ is the sole intent that reaches here with confidence
+    "none" in the frontend's classifyIntent (see
+    frontend/src/conversation/intent.js) - every other intent (booking,
+    cancel, update, view, yes/no, symptom check) has its own dedicated,
+    fully deterministic handler above and never reaches this function.
+    That existing intent-dispatch boundary IS the LLM eligibility gate;
+    no second classifier is introduced here.
+
+    `parameters.get('message')` is the raw user question, if the caller
+    provided one. The current frontend (useConversation.js) does not send
+    this yet for General FAQ - see backend/LLM_ASSISTANT_NOTES.md - so in
+    practice this still always falls back to the deterministic greeting
+    below until that is wired up as a separate, explicit step.
+    """
+    message_text = (parameters or {}).get('message')
+
+    if not llm_config.LLM_ENABLED or not message_text:
+        return [response_model.text_message(_GENERAL_FAQ_GREETING)]
+
+    result = assistant_service.answer(message_text)
+
+    if result["allowed"] and result["source"] == "llm":
+        return [response_model.assistant_response_message(
+            result["text"], provider=result.get("provider", "claude")
+        )]
+
+    # Every refusal/failure path in assistant_service.answer() already
+    # produces a safe, deterministic, non-leaking message - reuse it
+    # directly rather than inventing a second fallback message here.
+    return [response_model.text_message(result["text"])]

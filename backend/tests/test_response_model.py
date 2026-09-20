@@ -59,6 +59,25 @@ class ResponseModelTest(unittest.TestCase):
         msg = response_model.symptom_guidance_message("text", "unknown", [])
         self.assertEqual(msg["suggestions"], [])
 
+    def test_assistant_response_message_shape(self):
+        msg = response_model.assistant_response_message("Here is some general information.")
+        self.assertEqual(
+            msg,
+            {
+                "type": "assistant_response",
+                "content": {
+                    "text": "Here is some general information.",
+                    "provider": "claude",
+                    "disclaimer": "AI-generated general information, not medical advice.",
+                },
+                "suggestions": [],
+            },
+        )
+
+    def test_assistant_response_message_provider_is_configurable(self):
+        msg = response_model.assistant_response_message("text", provider="test-provider")
+        self.assertEqual(msg["content"]["provider"], "test-provider")
+
     def test_success_response_envelope_shape(self):
         messages = [response_model.text_message("Hi")]
         envelope = response_model.success_response(messages, intent="General FAQ")

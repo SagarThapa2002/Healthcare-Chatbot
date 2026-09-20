@@ -51,6 +51,33 @@ describe('MessageBubble', () => {
     );
   });
 
+  test('renders an assistant_response message with its text and disclaimer', () => {
+    render(
+      <MessageBubble
+        message={{
+          sender: 'bot',
+          type: 'assistant_response',
+          content: {
+            text: 'A balanced diet includes a variety of foods.',
+            provider: 'claude',
+            disclaimer: 'AI-generated general information, not medical advice.',
+          },
+          suggestions: [],
+        }}
+      />
+    );
+    const bubble = screen.getByRole('group', { name: /assistant said/i });
+    expect(bubble).toHaveTextContent('A balanced diet includes a variety of foods.');
+    expect(bubble).toHaveTextContent('AI-generated general information, not medical advice.');
+  });
+
+  test('does not render a disclaimer for a plain text message', () => {
+    render(
+      <MessageBubble message={{ sender: 'bot', type: 'text', content: { text: 'Hi there' }, suggestions: [] }} />
+    );
+    expect(screen.queryByText(/not medical advice/i)).not.toBeInTheDocument();
+  });
+
   test('falls back gracefully for an unknown message type instead of crashing', () => {
     render(
       <MessageBubble message={{ sender: 'bot', type: 'mystery_type', content: {}, suggestions: [] }} />

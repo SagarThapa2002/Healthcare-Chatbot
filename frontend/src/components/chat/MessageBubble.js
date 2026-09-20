@@ -6,6 +6,7 @@ const MESSAGE_TEXT_BY_TYPE = {
   text: (content) => content?.text,
   validation_error: (content) => content?.text,
   booking_confirmation: (content) => content?.text,
+  assistant_response: (content) => content?.text,
 };
 
 // Shared with ChatPanel's aria-live announcement so both read a message's
@@ -21,6 +22,14 @@ function getMessageText(message) {
 function MessageBubble({ message }) {
   const isUser = message.sender === 'user';
   const text = getMessageText(message);
+  // Only ever present on a genuine successful assistant_response - see
+  // response_model.assistant_response_message. Shown small and muted
+  // (not color alone - also smaller size, on its own line) so it reads as
+  // a secondary note rather than part of the answer itself.
+  const disclaimer =
+    message.sender === 'bot' && message.type === 'assistant_response'
+      ? message.content?.disclaimer
+      : null;
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -35,6 +44,7 @@ function MessageBubble({ message }) {
         ].join(' ')}
       >
         {text}
+        {disclaimer && <p className="mt-1.5 text-xs italic text-muted">{disclaimer}</p>}
       </div>
     </div>
   );

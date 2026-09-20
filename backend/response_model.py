@@ -84,6 +84,24 @@ def symptom_guidance_message(text, urgency, matched_rules, suggestions=None):
     }
 
 
+def assistant_response_message(text, *, provider="claude", suggestions=None):
+    """Only for a genuine successful response from the LLM assistant
+    (backend/assistant_service.py). Deterministic responses (appointments,
+    symptom guidance, general FAQ fallback text, etc.) must never use this
+    builder or carry this metadata - `provider` identifies Claude only
+    when Claude actually produced the text.
+    """
+    return {
+        "type": "assistant_response",
+        "content": {
+            "text": text,
+            "provider": provider,
+            "disclaimer": "AI-generated general information, not medical advice.",
+        },
+        "suggestions": suggestions or [],
+    }
+
+
 def success_response(messages, intent):
     return {
         "success": True,

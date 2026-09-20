@@ -1,3 +1,4 @@
 Flask==2.3.2
 Flask-Cors==4.0.0
 Werkzeug==2.3.7
+anthropic==1.7.0

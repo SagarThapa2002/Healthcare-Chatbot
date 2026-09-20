@@ -136,7 +136,18 @@ function useConversation() {
         setBooking(next);
         sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
       } else {
-        const parameters = intent === 'Symptom Check' ? { symptom: text } : {};
+        // General FAQ is the sole "none confidence" / unclassified fallback
+        // in classifyIntent (see conversation/intent.js) - sending the raw
+        // text only for that case, and only here, lets the backend's LLM
+        // routing (chatbot_logic.py's General FAQ branch) see the actual
+        // question without introducing a second intent classifier or
+        // changing what's sent for any other intent.
+        let parameters = {};
+        if (intent === 'Symptom Check') {
+          parameters = { symptom: text };
+        } else if (intent === 'General FAQ') {
+          parameters = { message: text };
+        }
         sayEnvelope(await callBackend(intent, parameters));
       }
     } catch (err) {
