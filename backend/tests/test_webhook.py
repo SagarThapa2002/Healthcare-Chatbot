@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from app import app
-from backend import chatbot_logic
+from backend import availability_service, chatbot_logic
 
 
 class WebhookTestCase(unittest.TestCase):
@@ -12,6 +12,14 @@ class WebhookTestCase(unittest.TestCase):
     temporary directory before touching the webhook, so the real
     backend/appointments.json (which holds a genuine booking) is never
     read from or written to by any test in this class.
+
+    chatbot_logic.py and availability_service.py each independently
+    compute their own APPOINTMENTS_FILE constant (both point at the same
+    real file by default) - since Phase 6.1 Slice 3 (Step 2),
+    _handle_book_appointment calls into availability_service for
+    date/slot availability checks, so both must be patched or that
+    "never read from the real file" guarantee above would be broken for
+    every booking test in this class.
     """
 
     def setUp(self):
@@ -23,10 +31,15 @@ class WebhookTestCase(unittest.TestCase):
 
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_availability_appointments = patch.object(
+            availability_service, 'APPOINTMENTS_FILE', self.appointments_file
+        )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_availability_appointments.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
 
@@ -69,12 +82,22 @@ class WebhookTestCase(unittest.TestCase):
         )
 
     def test_booking_flow_produces_booking_confirmation_with_appointment(self):
-        # Step through booking exactly as the real frontend drives it - the
-        # backend itself does no validation of these fields.
+        # Step through booking exactly as the real frontend drives it.
+        # Since Phase 6.1 Slice 3 (Step 2), the sequence is
+        # name -> provider -> date -> slot -> confirm; "dr-patel" and
+        # "2026-12-28" (a real, synthetic provider/Monday - see
+        # backend/providers.json / backend/provider_availability.json)
+        # are used because the backend now validates the provider and
+        # checks real availability for the date/slot, rather than
+        # accepting any format-valid strings unconditionally.
         self.post_webhook("Book Appointment", {"name": "Test Patient"})
-        self.post_webhook("Book Appointment", {"name": "Test Patient", "date": "2026-12-26"})
+        self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": "dr-patel"})
+        self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+        )
         confirm = self.post_webhook(
-            "Book Appointment", {"name": "Test Patient", "date": "2026-12-26", "time": "10:00"}
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
         ).get_json()
         self.assertEqual(confirm["messages"][0]["type"], "text")
         self.assertIn("yes or no", confirm["messages"][0]["content"]["text"])
@@ -86,7 +109,7 @@ class WebhookTestCase(unittest.TestCase):
         self.assertEqual(message["type"], "booking_confirmation")
         self.assertEqual(
             message["content"]["appointment"],
-            {"name": "Test Patient", "date": "2026-12-26", "time": "10:00"},
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
         )
         self.assertIn("has been booked", message["content"]["text"])
 
@@ -142,12 +165,20 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
 
+        # Both chatbot_logic's and availability_service's independent
+        # APPOINTMENTS_FILE constants must be patched - see
+        # WebhookTestCase's setUp docstring above for why.
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_availability_appointments = patch.object(
+            availability_service, 'APPOINTMENTS_FILE', self.appointments_file
+        )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_availability_appointments.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
 
@@ -155,8 +186,17 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
         return self.client.post('/webhook/webhook', json=body)
 
-    def _book_and_confirm(self, name="Test Patient", date="2026-12-26", time="10:00"):
-        self.post_webhook("Book Appointment", {"name": name, "date": date, "time": time})
+    def _book_and_confirm(self, name="Test Patient", provider_id="dr-patel", date="2026-12-28", time="10:00"):
+        # "dr-patel"/"2026-12-28" (a Monday) are a real, synthetic
+        # provider/date pair (see backend/providers.json /
+        # backend/provider_availability.json) - since Phase 6.1 Slice 3
+        # (Step 2), _handle_book_appointment validates the provider and
+        # checks real availability, so an arbitrary providerId/date can
+        # no longer reach the confirmation step.
+        self.post_webhook(
+            "Book Appointment",
+            {"name": name, "providerId": provider_id, "date": date, "time": time},
+        )
         self.post_webhook("YesIntent")
 
     def test_update_appointment_without_name_does_not_crash(self):
