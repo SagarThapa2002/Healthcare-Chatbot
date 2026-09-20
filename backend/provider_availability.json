@@ -1,0 +1,37 @@
+[
+  {
+    "providerId": "dr-patel",
+    "dayOfWeek": "Monday",
+    "startTime": "09:00",
+    "endTime": "17:00",
+    "slotMinutes": 30
+  },
+  {
+    "providerId": "dr-patel",
+    "dayOfWeek": "Wednesday",
+    "startTime": "09:00",
+    "endTime": "17:00",
+    "slotMinutes": 30
+  },
+  {
+    "providerId": "dr-nguyen",
+    "dayOfWeek": "Tuesday",
+    "startTime": "10:00",
+    "endTime": "15:00",
+    "slotMinutes": 20
+  },
+  {
+    "providerId": "dr-nguyen",
+    "dayOfWeek": "Thursday",
+    "startTime": "10:00",
+    "endTime": "15:00",
+    "slotMinutes": 20
+  },
+  {
+    "providerId": "dr-okafor",
+    "dayOfWeek": "Friday",
+    "startTime": "08:00",
+    "endTime": "12:00",
+    "slotMinutes": 15
+  }
+]

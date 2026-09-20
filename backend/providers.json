@@ -1,0 +1,20 @@
+[
+  {
+    "id": "dr-patel",
+    "name": "Dr. Patel",
+    "specialty": "General Practice",
+    "location": "Main Clinic"
+  },
+  {
+    "id": "dr-nguyen",
+    "name": "Dr. Nguyen",
+    "specialty": "Pediatrics",
+    "location": "Main Clinic"
+  },
+  {
+    "id": "dr-okafor",
+    "name": "Dr. Okafor",
+    "specialty": "Dermatology",
+    "location": "North Clinic"
+  }
+]
