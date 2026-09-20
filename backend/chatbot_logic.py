@@ -9,11 +9,14 @@ and _handle_view_appointments below) - those are carried over unchanged,
 not "fixed", since fixing them wasn't asked for in this phase.
 """
 import json
+import logging
 import os
 
 from backend import assistant_service
 from backend import llm_config
 from backend import response_model
+
+logger = logging.getLogger(__name__)
 
 APPOINTMENTS_FILE = os.path.join(os.path.dirname(__file__), 'appointments.json')
 PENDING_FILE = os.path.join(os.path.dirname(__file__), 'pending_appointments.json')
@@ -38,10 +41,12 @@ def list_appointments():
         return []
 
 
-def handle_webhook_request(payload):
+def handle_webhook_request(payload, request_id=None):
     query_result = payload.get('queryResult', {})
     intent = query_result.get('intent', {}).get('displayName', '')
     parameters = query_result.get('parameters', {})
+
+    logger.info("dispatching request_id=%s intent=%s", request_id, intent)
 
     if intent == "Symptom Check":
         messages = _handle_symptom_check(parameters)
@@ -58,13 +63,13 @@ def handle_webhook_request(payload):
     elif intent == "View Appointments":
         messages = _handle_view_appointments()
     elif intent == "General FAQ":
-        messages = _handle_general_faq(parameters)
+        messages = _handle_general_faq(parameters, request_id=request_id)
     else:
         messages = [response_model.text_message(
             "Sorry, I didn't understand that. Could you rephrase or ask something else?"
         )]
 
-    return response_model.success_response(messages, intent=intent)
+    return response_model.success_response(messages, intent=intent, request_id=request_id)
 
 
 def _handle_symptom_check(parameters):
@@ -205,7 +210,7 @@ _GENERAL_FAQ_GREETING = (
 )
 
 
-def _handle_general_faq(parameters):
+def _handle_general_faq(parameters, request_id=None):
     """General FAQ is the sole intent that reaches here with confidence
     "none" in the frontend's classifyIntent (see
     frontend/src/conversation/intent.js) - every other intent (booking,
@@ -225,7 +230,7 @@ def _handle_general_faq(parameters):
     if not llm_config.LLM_ENABLED or not message_text:
         return [response_model.text_message(_GENERAL_FAQ_GREETING)]
 
-    result = assistant_service.answer(message_text)
+    result = assistant_service.answer(message_text, request_id=request_id)
 
     if result["allowed"] and result["source"] == "llm":
         return [response_model.assistant_response_message(

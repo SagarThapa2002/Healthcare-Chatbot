@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from app import app
 from backend import chatbot_logic, claude_provider, llm_config, mock_provider
@@ -101,7 +101,7 @@ class GeneralFaqRoutingGateTest(LLMRoutingTestCase):
             }
             self.post_webhook("General FAQ", {"message": "What is a balanced diet?"})
 
-        mock_answer.assert_called_once_with("What is a balanced diet?")
+        mock_answer.assert_called_once_with("What is a balanced diet?", request_id=ANY)
 
     def test_does_not_call_assistant_service_when_llm_disabled(self):
         with patch.object(llm_config, 'LLM_ENABLED', False), \

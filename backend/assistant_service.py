@@ -40,11 +40,14 @@ WHAT THIS MODULE IS NOT
   LLM_ENABLED is explicitly set to true AND a request already passed the
   policy check.
 """
+import logging
 import re
 
 from backend import claude_provider
 from backend import llm_config
 from backend import mock_provider
+
+logger = logging.getLogger(__name__)
 
 # --- Policy categories --------------------------------------------------
 # Every non-"allowed" outcome is one of these fixed strings. A caller (or
@@ -245,7 +248,7 @@ def _get_provider():
     return "claude", claude_provider.generate_reply
 
 
-def answer(message):
+def answer(message, request_id=None):
     """The single entry point a future caller would use (not chatbot_logic.py
     yet). Always returns a dict:
 
@@ -259,9 +262,17 @@ def answer(message):
     Never raises. Never exposes API keys, environment variables, the
     system prompt, or internal exception details - any provider failure or
     unexpected error becomes the same generic, calm fallback message.
+
+    `request_id`, if given, is logged alongside the policy category and
+    (when applicable) the provider name - metadata only, never the message
+    text or the provider's raw response. See backend/LOGGING_NOTES.md.
     """
     category = classify_request(message)
     if category != ALLOWED:
+        logger.info(
+            "assistant_service request_id=%s category=%s allowed=False",
+            request_id, category,
+        )
         return {
             "allowed": False,
             "category": category,
@@ -270,6 +281,10 @@ def answer(message):
         }
 
     if not llm_config.LLM_ENABLED:
+        logger.info(
+            "assistant_service request_id=%s category=%s allowed=False",
+            request_id, LLM_DISABLED,
+        )
         return {
             "allowed": False,
             "category": LLM_DISABLED,
@@ -280,17 +295,25 @@ def answer(message):
     try:
         provider_name, provider_fn = _get_provider()
         raw_text = provider_fn(message, system=build_system_prompt())
-    except claude_provider.ProviderError:
+    except claude_provider.ProviderError as e:
         # Never surface str(exception) or any provider internals here.
+        logger.warning(
+            "assistant_service request_id=%s category=%s exception_type=%s",
+            request_id, PROVIDER_UNAVAILABLE, type(e).__name__,
+        )
         return {
             "allowed": False,
             "category": PROVIDER_UNAVAILABLE,
             "text": _UNAVAILABLE_MESSAGE,
             "source": "policy",
         }
-    except Exception:
+    except Exception as e:
         # Last-resort safety net: this module must never crash its caller,
         # even on a bug or an error type not yet accounted for above.
+        logger.warning(
+            "assistant_service request_id=%s category=%s exception_type=%s",
+            request_id, PROVIDER_UNAVAILABLE, type(e).__name__,
+        )
         return {
             "allowed": False,
             "category": PROVIDER_UNAVAILABLE,
@@ -299,6 +322,10 @@ def answer(message):
         }
 
     if not _passes_output_safety_check(raw_text):
+        logger.info(
+            "assistant_service request_id=%s category=%s provider=%s allowed=False",
+            request_id, UNSAFE_OUTPUT_BLOCKED, provider_name,
+        )
         return {
             "allowed": False,
             "category": UNSAFE_OUTPUT_BLOCKED,
@@ -306,6 +333,10 @@ def answer(message):
             "source": "policy",
         }
 
+    logger.info(
+        "assistant_service request_id=%s category=%s provider=%s allowed=True",
+        request_id, ALLOWED, provider_name,
+    )
     return {
         "allowed": True,
         "category": ALLOWED,

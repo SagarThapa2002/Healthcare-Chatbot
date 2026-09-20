@@ -20,10 +20,20 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_meta():
+def new_request_id():
+    """Public entry point for generating a request id outside this module.
+
+    Lets webhook.py generate exactly one id per request up front and thread
+    it through logging and into the eventual response meta, instead of a
+    second, uncorrelated id being generated here later.
+    """
+    return _new_request_id()
+
+
+def _build_meta(request_id=None):
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "requestId": _new_request_id(),
+        "requestId": request_id or _new_request_id(),
         "timestamp": _now_iso(),
     }
 
@@ -102,21 +112,21 @@ def assistant_response_message(text, *, provider="claude", suggestions=None):
     }
 
 
-def success_response(messages, intent):
+def success_response(messages, intent, request_id=None):
     return {
         "success": True,
         "error": None,
         "messages": messages,
         "context": {"intent": intent},
-        "meta": _build_meta(),
+        "meta": _build_meta(request_id=request_id),
     }
 
 
-def error_response(message, code="INTERNAL_ERROR"):
+def error_response(message, code="INTERNAL_ERROR", request_id=None):
     return {
         "success": False,
         "error": {"code": code, "message": message},
         "messages": [],
         "context": None,
-        "meta": _build_meta(),
+        "meta": _build_meta(request_id=request_id),
     }

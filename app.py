@@ -1,6 +1,18 @@
+import logging
+import os
+
 from flask import Flask
 from flask_cors import CORS
 from backend.webhook import webhook_bp
+
+# Metadata-only structured logging - see backend/LOGGING_NOTES.md for
+# exactly what is and isn't logged. LOG_LEVEL defaults to INFO and is
+# configurable through the environment; nothing here ever writes a log
+# file, so this has no retention/rotation concerns of its own.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 # Create the Flask app
 app = Flask(__name__)
