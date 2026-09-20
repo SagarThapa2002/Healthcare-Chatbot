@@ -65,6 +65,25 @@ def booking_confirmation_message(text, appointment, suggestions=None):
     }
 
 
+def symptom_guidance_message(text, urgency, matched_rules, suggestions=None):
+    """Not currently emitted by any webhook branch - see backend/symptom_triage.py
+    and backend/SYMPTOM_RULES_SOURCES.md. This is an additive builder only:
+    chatbot_logic.py does not call symptom_triage.classify_symptom() yet, so
+    nothing in the live app produces this message type today. Wiring it in
+    (and teaching the frontend to render it) is a deliberate, separate,
+    later step - see the Phase 5.3 design notes for why.
+
+    `urgency` and `matchedRules` ride alongside `text` in `content`, the
+    same way booking_confirmation_message carries `appointment` alongside
+    its own `text`.
+    """
+    return {
+        "type": "symptom_guidance",
+        "content": {"text": text, "urgency": urgency, "matchedRules": list(matched_rules)},
+        "suggestions": suggestions or [],
+    }
+
+
 def success_response(messages, intent):
     return {
         "success": True,

@@ -23,6 +23,7 @@ This project demonstrates a healthcare chatbot that:
 - Has a Flask-based backend for webhook logic
 - Stores booked appointments in a local JSON file
 - Exposes an API endpoint to view all booked appointments
+- Includes a deterministic, rule-based symptom-triage module (`backend/symptom_triage.py`) that is fully implemented and tested but not yet connected to the live chatbot, and whose production rule file currently contains zero active (clinically reviewed) rules - see `backend/SYMPTOM_RULES_SOURCES.md`
 
 ---
 

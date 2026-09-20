@@ -35,6 +35,30 @@ class ResponseModelTest(unittest.TestCase):
             },
         )
 
+    def test_symptom_guidance_message_shape(self):
+        # Not currently emitted by any webhook branch (see chatbot_logic.py,
+        # symptom_triage.py, and SYMPTOM_RULES_SOURCES.md) - tested directly
+        # here so the type itself is real and correct ahead of being wired in.
+        msg = response_model.symptom_guidance_message(
+            "TEST MESSAGE - synthetic fixture", "emergency", ["test-emergency-fever-phrase"]
+        )
+        self.assertEqual(
+            msg,
+            {
+                "type": "symptom_guidance",
+                "content": {
+                    "text": "TEST MESSAGE - synthetic fixture",
+                    "urgency": "emergency",
+                    "matchedRules": ["test-emergency-fever-phrase"],
+                },
+                "suggestions": [],
+            },
+        )
+
+    def test_symptom_guidance_message_defaults_to_empty_suggestions(self):
+        msg = response_model.symptom_guidance_message("text", "unknown", [])
+        self.assertEqual(msg["suggestions"], [])
+
     def test_success_response_envelope_shape(self):
         messages = [response_model.text_message("Hi")]
         envelope = response_model.success_response(messages, intent="General FAQ")

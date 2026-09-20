@@ -1,0 +1,5 @@
+{
+  "schemaVersion": "1.0",
+  "rules": [],
+  "notice": "This production rule file intentionally contains ZERO active rules. No symptom-triage content has been clinically reviewed or sourced yet. Do not add a rule here until it has a real, qualified clinical reference - see backend/SYMPTOM_RULES_SOURCES.md. Synthetic example rules for testing live only in backend/tests/test_symptom_triage.py, never here."
+}
