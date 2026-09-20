@@ -21,6 +21,7 @@ backend/PROVIDER_AVAILABILITY_NOTES.md.
 import json
 import logging
 import os
+import uuid
 
 from backend import assistant_service
 from backend import availability_service
@@ -456,6 +457,16 @@ def _handle_yes_intent():
     confirmation (or an explicit "no") clears it - and no appointment is
     appended.
 
+    Next Phase 6.1 slice: a stable `id` (str(uuid.uuid4()), matching
+    response_model._new_request_id()'s existing convention) is generated
+    here and added to the appointment dict immediately before it is
+    persisted - the only point in the codebase where a new appointment is
+    actually created. This is additive only: existing legacy records in
+    appointments.json have no `id` and are not migrated or backfilled;
+    _handle_update_appointment/_handle_cancel_appointment/
+    _handle_view_appointments are unchanged and still operate by name
+    only - wiring them to use `id` is a deliberate, separate, later step.
+
     Returns (messages, booking_stage) - Phase 6.1, Slice 3, Step 4
     (revised): reports "booked" only for a genuine successful
     confirmation. Every failure path reports None (no booking_stage) -
@@ -505,6 +516,7 @@ def _handle_yes_intent():
             except json.JSONDecodeError:
                 appointments = []
 
+        appointment['id'] = str(uuid.uuid4())
         appointments.append(appointment)
         _save_appointments(appointments)
         os.remove(PENDING_FILE)

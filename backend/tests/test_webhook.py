@@ -107,10 +107,16 @@ class WebhookTestCase(unittest.TestCase):
 
         self.assertTrue(booked["success"])
         self.assertEqual(message["type"], "booking_confirmation")
-        self.assertEqual(
-            message["content"]["appointment"],
-            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
-        )
+        appointment = message["content"]["appointment"]
+        self.assertEqual(appointment["name"], "Test Patient")
+        self.assertEqual(appointment["providerId"], "dr-patel")
+        self.assertEqual(appointment["date"], "2026-12-28")
+        self.assertEqual(appointment["time"], "10:00")
+        # A stable id is generated server-side at booking time (next Phase
+        # 6.1 slice) - checked for presence/non-emptiness only, never an
+        # exact value, matching this project's existing convention for
+        # generated ids (see meta.requestId's own tests).
+        self.assertTrue(appointment["id"])
         self.assertIn("has been booked", message["content"]["text"])
 
         # The booking was written to the temp file, never the real one.

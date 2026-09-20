@@ -794,5 +794,71 @@ class BookingStageContractTest(BookingFlowTestCase):
                 self.assertNotIn("bookingStage", response.get_json()["context"])
 
 
+class AppointmentIdTest(BookingFlowTestCase):
+    """Next Phase 6.1 slice: a stable, server-generated `id` is attached to
+    every newly created appointment. Deliberately does NOT touch
+    update/cancel/view - those still operate by name only; wiring them to
+    use `id` is a separate, later step.
+    """
+
+    def _book_and_confirm(self, name="Test Patient", date="2026-12-28", time="10:00"):
+        self.post_webhook(
+            "Book Appointment", {"name": name, "providerId": "dr-patel", "date": date, "time": time}
+        )
+        return self.post_webhook("YesIntent").get_json()
+
+    def test_persisted_appointment_has_a_non_empty_id(self):
+        self._book_and_confirm()
+        with open(self.appointments_file, 'r') as f:
+            saved = json.load(f)
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0].get("id"))
+
+    def test_confirmation_response_id_matches_the_persisted_id(self):
+        booked = self._book_and_confirm()
+        response_id = booked["messages"][0]["content"]["appointment"]["id"]
+
+        with open(self.appointments_file, 'r') as f:
+            saved = json.load(f)
+        self.assertEqual(saved[0]["id"], response_id)
+
+    def test_two_separate_bookings_get_different_ids(self):
+        first = self._book_and_confirm(name="Test Patient", date="2026-12-28", time="10:00")
+        second = self._book_and_confirm(name="Test Patient", date="2026-12-28", time="10:30")
+
+        first_id = first["messages"][0]["content"]["appointment"]["id"]
+        second_id = second["messages"][0]["content"]["appointment"]["id"]
+        self.assertNotEqual(first_id, second_id)
+
+    def test_id_is_not_written_to_the_pending_file(self):
+        # id is only assigned at the final, confirmed-creation step in
+        # _handle_yes_intent - the pending record itself never has one.
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        with open(self.pending_file, 'r') as f:
+            pending = json.load(f)
+        self.assertNotIn("id", pending)
+
+    def test_legacy_appointment_without_an_id_is_still_listed_correctly(self):
+        # Simulates a pre-existing legacy record (no id, no providerId) -
+        # never migrated or backfilled - alongside a newly created one.
+        with open(self.appointments_file, 'w') as f:
+            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+
+        response = self.post_webhook("View Appointments")
+        text = response.get_json()["messages"][0]["content"]["text"]
+        self.assertIn("Legacy Patient", text)
+
+    def test_legacy_appointment_without_an_id_can_still_be_cancelled_by_name(self):
+        with open(self.appointments_file, 'w') as f:
+            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+
+        response = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"})
+        text = response.get_json()["messages"][0]["content"]["text"]
+        self.assertIn("successfully canceled", text)
+
+
 if __name__ == '__main__':
     unittest.main()
