@@ -662,5 +662,137 @@ class BookingErrorHandlingTest(BookingFlowTestCase):
         self.assertIn("virtual healthcare assistant", self._text(response))
 
 
+class BookingStageContractTest(BookingFlowTestCase):
+    """Phase 6.1, Slice 3, Step 4 (revised): proves context.bookingStage is
+    reported correctly at every point in the booking flow - structurally,
+    not by inspecting message text - so a client can tell "advanced" from
+    "rejected, still on this stage" without duplicating the validation
+    decisions _handle_book_appointment already makes.
+    """
+
+    def _stage(self, response):
+        return response.get_json()["context"].get("bookingStage")
+
+    def test_missing_name_reports_name_stage(self):
+        response = self.post_webhook("Book Appointment", {})
+        self.assertEqual(self._stage(response), "name")
+
+    def test_missing_provider_reports_provider_stage(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        self.assertEqual(self._stage(response), "provider")
+
+    def test_invalid_provider_remains_at_provider_stage(self):
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "Not A Real Doctor"}
+        )
+        self.assertEqual(self._stage(response), "provider")
+
+    def test_valid_provider_advances_to_date_stage(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": "dr-patel"})
+        self.assertEqual(self._stage(response), "date")
+
+    def test_missing_date_reports_date_stage(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": "dr-patel"})
+        self.assertEqual(self._stage(response), "date")
+
+    def test_malformed_date_remains_at_date_stage(self):
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-02-30"}
+        )
+        self.assertEqual(self._stage(response), "date")
+
+    def test_no_weekday_availability_remains_at_date_stage(self):
+        # dr-patel has no Tuesday availability (see backend/provider_availability.json).
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-29"}
+        )
+        self.assertEqual(self._stage(response), "date")
+
+    def test_fully_booked_remains_at_date_stage(self):
+        raw_slots = availability_service.get_available_slots("dr-patel", "2026-12-28", appointments=[])
+        filler = [
+            {"name": "Filler", "providerId": "dr-patel", "date": "2026-12-28", "time": slot, "status": "booked"}
+            for slot in raw_slots
+        ]
+        with open(self.appointments_file, 'w') as f:
+            json.dump(filler, f)
+
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+        )
+        self.assertEqual(self._stage(response), "date")
+
+    def test_valid_date_advances_to_slot_stage(self):
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+        )
+        self.assertEqual(self._stage(response), "slot")
+
+    def test_invalid_slot_remains_at_slot_stage(self):
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "not-a-time"},
+        )
+        self.assertEqual(self._stage(response), "slot")
+
+    def test_occupied_slot_remains_at_slot_stage(self):
+        with open(self.appointments_file, 'w') as f:
+            json.dump(
+                [{"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+                  "time": "10:00", "status": "booked"}],
+                f,
+            )
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        self.assertEqual(self._stage(response), "slot")
+
+    def test_valid_slot_advances_to_confirm_stage(self):
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        self.assertEqual(self._stage(response), "confirm")
+
+    def test_successful_yes_intent_reports_booked_stage(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        response = self.post_webhook("YesIntent")
+        self.assertEqual(self._stage(response), "booked")
+
+    def test_yes_intent_with_no_pending_booking_omits_booking_stage(self):
+        response = self.post_webhook("YesIntent")
+        self.assertNotIn("bookingStage", response.get_json()["context"])
+
+    def test_yes_intent_race_rejection_omits_booking_stage(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        with open(self.appointments_file, 'w') as f:
+            json.dump(
+                [{"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+                  "time": "10:00", "status": "booked"}],
+                f,
+            )
+        response = self.post_webhook("YesIntent")
+        self.assertNotIn("bookingStage", response.get_json()["context"])
+
+    def test_non_booking_intents_never_carry_a_booking_stage(self):
+        for intent, params in [
+            ("General FAQ", {}),
+            ("Symptom Check", {"symptom": "a headache"}),
+            ("Update Appointment", {"name": "Test Patient"}),
+            ("Cancel Appointment", {"name": "Test Patient"}),
+            ("View Appointments", {}),
+        ]:
+            with self.subTest(intent=intent):
+                response = self.post_webhook(intent, params)
+                self.assertNotIn("bookingStage", response.get_json()["context"])
+
+
 if __name__ == '__main__':
     unittest.main()

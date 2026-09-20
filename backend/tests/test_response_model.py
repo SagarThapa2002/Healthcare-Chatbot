@@ -90,6 +90,19 @@ class ResponseModelTest(unittest.TestCase):
         self.assertTrue(envelope["meta"]["requestId"])
         self.assertTrue(envelope["meta"]["timestamp"])
 
+    def test_success_response_omits_booking_stage_by_default(self):
+        envelope = response_model.success_response([], intent="Book Appointment")
+        self.assertEqual(envelope["context"], {"intent": "Book Appointment"})
+        self.assertNotIn("bookingStage", envelope["context"])
+
+    def test_success_response_includes_booking_stage_when_given(self):
+        envelope = response_model.success_response([], intent="Book Appointment", booking_stage="provider")
+        self.assertEqual(envelope["context"], {"intent": "Book Appointment", "bookingStage": "provider"})
+
+    def test_success_response_booking_stage_none_is_treated_as_omitted(self):
+        envelope = response_model.success_response([], intent="Book Appointment", booking_stage=None)
+        self.assertNotIn("bookingStage", envelope["context"])
+
     def test_success_response_request_id_is_unique_per_call(self):
         envelope_a = response_model.success_response([], intent="General FAQ")
         envelope_b = response_model.success_response([], intent="General FAQ")

@@ -112,12 +112,28 @@ def assistant_response_message(text, *, provider="claude", suggestions=None):
     }
 
 
-def success_response(messages, intent, request_id=None):
+def success_response(messages, intent, request_id=None, booking_stage=None):
+    """`booking_stage`, if given, is folded into `context` as `bookingStage`
+    alongside `intent` - optional and additive, so every existing caller
+    that doesn't pass it gets the exact same `context` shape as before.
+
+    Phase 6.1, Slice 3, Step 4 (revised): lets a caller (currently only
+    chatbot_logic.py's Book Appointment / YesIntent handling) structurally
+    report which stage of the booking flow it is now waiting on - one of
+    "name", "provider", "date", "slot", "confirm", "booked" - so the
+    frontend can use it as the authority for whether a just-submitted
+    provider/slot value was actually accepted, instead of inferring that
+    from response text or `success` (which only means the request was
+    processed, not that any particular field was valid).
+    """
+    context = {"intent": intent}
+    if booking_stage is not None:
+        context["bookingStage"] = booking_stage
     return {
         "success": True,
         "error": None,
         "messages": messages,
-        "context": {"intent": intent},
+        "context": context,
         "meta": _build_meta(request_id=request_id),
     }
 

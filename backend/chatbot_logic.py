@@ -60,12 +60,17 @@ def handle_webhook_request(payload, request_id=None):
 
     logger.info("dispatching request_id=%s intent=%s", request_id, intent)
 
+    # Only Book Appointment / YesIntent ever set this - every other intent
+    # leaves it None, so response_model.success_response() omits
+    # `bookingStage` from `context` for them entirely (see its docstring).
+    booking_stage = None
+
     if intent == "Symptom Check":
         messages = _handle_symptom_check(parameters)
     elif intent == "Book Appointment":
-        messages = _handle_book_appointment(parameters)
+        messages, booking_stage = _handle_book_appointment(parameters)
     elif intent == "YesIntent":
-        messages = _handle_yes_intent()
+        messages, booking_stage = _handle_yes_intent()
     elif intent == "NoIntent":
         messages = _handle_no_intent()
     elif intent == "Update Appointment":
@@ -81,7 +86,9 @@ def handle_webhook_request(payload, request_id=None):
             "Sorry, I didn't understand that. Could you rephrase or ask something else?"
         )]
 
-    return response_model.success_response(messages, intent=intent, request_id=request_id)
+    return response_model.success_response(
+        messages, intent=intent, request_id=request_id, booking_stage=booking_stage
+    )
 
 
 def _handle_symptom_check(parameters):
@@ -328,6 +335,16 @@ def _handle_book_appointment(parameters):
     becomes a safe, deterministic fallback message - never a raw
     exception surfaced to the caller - matching the same convention
     assistant_service.answer() already uses for provider failures.
+
+    Returns (messages, booking_stage) - Phase 6.1, Slice 3, Step 4
+    (revised): `booking_stage` is one of "name", "provider", "date",
+    "slot", "confirm", reported alongside the existing text at every
+    return point, so a caller can tell "advanced" from "rejected, still
+    on this same stage" structurally (see response_model.success_response's
+    docstring) without inspecting `text` or duplicating the validation
+    decision made right here. This function still owns 100% of that
+    validation - the return value only ever *labels* a decision already
+    made above it, never adds a new one.
     """
     parameters = parameters or {}
     name = parameters.get('name')
@@ -337,11 +354,11 @@ def _handle_book_appointment(parameters):
 
     if not name:
         text = "Sure, may I have your name for the appointment?"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "name"
 
     if not provider_choice:
         text = f"Thanks {name}. Which provider would you like to see?\n{_format_provider_list()}"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "provider"
 
     provider_id = _resolve_provider_choice(provider_choice)
     if provider_id is None:
@@ -349,13 +366,13 @@ def _handle_book_appointment(parameters):
             "Sorry, I didn't recognize that provider. Please choose one from the list:\n"
             f"{_format_provider_list()}"
         )
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "provider"
 
     if not date:
         provider = provider_repository.find_provider(provider_id)
         provider_name = provider["name"] if provider else provider_id
         text = f"What date would you like to see {provider_name}? (YYYY-MM-DD)"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "date"
 
     try:
         status, _ = _check_date_availability(provider_id, date)
@@ -365,7 +382,7 @@ def _handle_book_appointment(parameters):
             provider_id, type(e).__name__,
         )
         text = "I couldn't check availability for that date. Could you give me a date in YYYY-MM-DD format?"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "date"
 
     provider = provider_repository.find_provider(provider_id)
     provider_name = provider["name"] if provider else provider_id
@@ -382,16 +399,16 @@ def _handle_book_appointment(parameters):
                 f"{provider_name} doesn't have any configured availability right now. "
                 "Could you try a different provider or date?"
             )
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "date"
 
     if status == _DATE_FULLY_BOOKED:
         text = f"{provider_name} is fully booked on {date}. Could you try a different date?"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "date"
 
     # status == _DATE_HAS_SLOTS
     if not slot_choice:
         text = f"Here are the available times on {date}:\n{_format_slot_list(provider_id, date)}"
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "slot"
 
     # _resolve_slot_choice never raises - any AvailabilityError it hits
     # (a malformed choice, or a data problem) is already turned into a
@@ -404,7 +421,7 @@ def _handle_book_appointment(parameters):
             "Sorry, that time isn't available anymore. Here are the current options:\n"
             f"{_format_slot_list(provider_id, date)}"
         )
-        return [response_model.text_message(text)]
+        return [response_model.text_message(text)], "slot"
 
     pending = {
         "name": name,
@@ -419,7 +436,7 @@ def _handle_book_appointment(parameters):
         f"{date} at {resolved_time}? (yes or no)"
     )
 
-    return [response_model.text_message(text)]
+    return [response_model.text_message(text)], "confirm"
 
 
 def _handle_yes_intent():
@@ -438,6 +455,15 @@ def _handle_yes_intent():
     pending record is deliberately left in place - only a successful
     confirmation (or an explicit "no") clears it - and no appointment is
     appended.
+
+    Returns (messages, booking_stage) - Phase 6.1, Slice 3, Step 4
+    (revised): reports "booked" only for a genuine successful
+    confirmation. Every failure path reports None (no booking_stage) -
+    the frontend already unconditionally resets its local booking state
+    after any "yes"/"no" reply regardless of outcome, so none of these
+    failure cases need a stage label for that existing behavior to work;
+    None simply omits `bookingStage` from the response (see
+    response_model.success_response's docstring).
     """
     if os.path.exists(PENDING_FILE):
         with open(PENDING_FILE, 'r') as f:
@@ -453,7 +479,7 @@ def _handle_yes_intent():
                 "Sorry, I couldn't confirm that appointment because some details are missing. "
                 "Please choose a provider, date, and time again."
             )
-            return [response_model.text_message(text)]
+            return [response_model.text_message(text)], None
 
         try:
             slot_still_available = availability_service.is_slot_available(provider_id, date, time)
@@ -463,14 +489,14 @@ def _handle_yes_intent():
                 provider_id, type(e).__name__,
             )
             text = "Sorry, I couldn't confirm that appointment right now. Please choose another time or date."
-            return [response_model.text_message(text)]
+            return [response_model.text_message(text)], None
 
         if not slot_still_available:
             text = (
                 "Sorry, that time is no longer available - it looks like it was just booked. "
                 "Please choose another time or date."
             )
-            return [response_model.text_message(text)]
+            return [response_model.text_message(text)], None
 
         appointments = []
         if os.path.exists(APPOINTMENTS_FILE):
@@ -484,10 +510,10 @@ def _handle_yes_intent():
         os.remove(PENDING_FILE)
 
         text = f"Your appointment for {appointment['name']} on {appointment['date']} at {appointment['time']} has been booked."
-        return [response_model.booking_confirmation_message(text, appointment)]
+        return [response_model.booking_confirmation_message(text, appointment)], "booked"
 
     text = "There is no appointment pending confirmation."
-    return [response_model.text_message(text)]
+    return [response_model.text_message(text)], None
 
 
 def _handle_no_intent():

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { detectIntent, INTERRUPTION_INTENTS } from '../conversation/intent';
-import { parseDate, parseTime } from '../conversation/dateTime';
+import { parseDate } from '../conversation/dateTime';
 import { isValidName } from '../conversation/validation';
 import {
   EMPTY_BOOKING,
@@ -99,6 +99,42 @@ function useConversation() {
           return;
         }
 
+        // Provider validity is entirely a backend concern
+        // (provider_repository.py / availability_service.py) - the
+        // frontend has no provider list and no matching rules of its own,
+        // so it only guards against an empty reply and forwards whatever
+        // the user typed exactly as given (an id, a name, or a number
+        // from the backend's displayed list).
+        //
+        // The attempted choice is sent, but only committed to local state
+        // if the backend's response proves it actually advanced past this
+        // stage - context.bookingStage is the backend's own structural
+        // report of which stage it's still waiting on (see
+        // response_model.success_response's docstring), so this never
+        // has to infer acceptance from response text or `success` (which
+        // only means the request was processed, not that the provider
+        // was valid). Checked against the exact expected next stage
+        // ('date'), not merely "not 'provider'" - so an unexpected,
+        // unknown, or future stage value fails closed (treated as
+        // rejected) rather than accidentally counting as acceptance. If
+        // the backend is still at 'provider' (rejected), `booking` is
+        // left exactly as it was, so the next reply is still correctly
+        // treated as another provider attempt - not misread as a date,
+        // which is the exact bug this closes.
+        if (stage === 'provider') {
+          if (!text.trim()) {
+            sayText("Please tell me which provider you'd like to see.");
+            return;
+          }
+          const attempted = { ...booking, providerId: text.trim() };
+          const envelope = await callBackend('Book Appointment', bookingParams(attempted));
+          const reportedStage = envelope.context?.bookingStage;
+          const providerAccepted = reportedStage === 'date';
+          setBooking(providerAccepted ? attempted : booking);
+          sayEnvelope(envelope);
+          return;
+        }
+
         if (stage === 'date') {
           const date = parseDate(text);
           if (!date) {
@@ -111,15 +147,36 @@ function useConversation() {
           return;
         }
 
-        if (stage === 'time') {
-          const time = parseTime(text);
-          if (!time) {
-            sayText('I couldn\'t understand that time. Try a format like 10:00, 10:30am, or 2pm.');
+        // Slot validity (does this time exist, is it still free) is
+        // entirely a backend concern (availability_service.py) - the
+        // frontend never computes or checks availability itself, so it
+        // only guards against an empty reply and forwards whatever the
+        // user typed exactly as given (an exact HH:MM value, or a number
+        // from the backend's displayed slot list - parseTime() is
+        // deliberately not used here, since a bare number like "2" is a
+        // valid slot choice but not a valid time).
+        //
+        // Same commit-only-on-confirmed-advance pattern as the provider
+        // stage above: the attempted slot is sent, but only kept in local
+        // state if context.bookingStage proves it was accepted. Checked
+        // against the exact expected next stage ('confirm'), not merely
+        // "not 'slot'" - so an unexpected, unknown, or future stage value
+        // fails closed (treated as rejected) rather than accidentally
+        // counting as acceptance. Otherwise `booking` is left unchanged,
+        // so the next reply is still treated as another slot attempt -
+        // not misread as a yes/no confirmation reply, which would
+        // otherwise leave the user stuck.
+        if (stage === 'slot') {
+          if (!text.trim()) {
+            sayText("Please tell me which time you'd like, or reply with its number from the list.");
             return;
           }
-          const next = { ...booking, time };
-          setBooking(next);
-          sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
+          const attempted = { ...booking, time: text.trim() };
+          const envelope = await callBackend('Book Appointment', bookingParams(attempted));
+          const reportedStage = envelope.context?.bookingStage;
+          const slotAccepted = reportedStage === 'confirm';
+          setBooking(slotAccepted ? attempted : booking);
+          sayEnvelope(envelope);
           return;
         }
 
@@ -132,7 +189,15 @@ function useConversation() {
       const intent = detectIntent(text);
       if (intent === 'Book Appointment') {
         const fields = extractInitialBookingFields(text);
-        const next = { active: true, name: fields.name || null, date: fields.date || null, time: fields.time || null };
+        const next = {
+          active: true,
+          name: fields.name || null,
+          // Never extracted from free text - see
+          // extractInitialBookingFields's own docstring in booking.js.
+          providerId: null,
+          date: fields.date || null,
+          time: fields.time || null,
+        };
         setBooking(next);
         sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
       } else {
