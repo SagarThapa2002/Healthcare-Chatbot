@@ -476,6 +476,173 @@ class ConfirmationStageTest(BookingFlowTestCase):
         self.assertEqual(message["content"]["appointment"]["providerId"], "dr-patel")
 
 
+class ConfirmationAvailabilityRecheckTest(BookingFlowTestCase):
+    """Phase 6.1, Slice 3, Step 3: _handle_yes_intent() now re-validates
+    the exact providerId/date/time immediately before persisting, closing
+    the race where the slot was available/valid when first selected
+    (Step 2) but got taken - or the pending record was otherwise never
+    valid - before the user actually confirmed.
+    """
+
+    def _write_pending(self, pending):
+        with open(self.pending_file, 'w') as f:
+            json.dump(pending, f)
+
+    def test_still_available_slot_is_confirmed_successfully(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        booked = self.post_webhook("YesIntent").get_json()
+        message = booked["messages"][0]
+
+        self.assertTrue(booked["success"])
+        self.assertEqual(message["type"], "booking_confirmation")
+        self.assertIn("has been booked", message["content"]["text"])
+
+    def test_successful_confirmation_still_removes_the_pending_file(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        self.assertTrue(os.path.exists(self.pending_file))
+
+        self.post_webhook("YesIntent")
+
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_persisted_appointment_contains_the_expected_provider_id(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        self.post_webhook("YesIntent")
+
+        with open(self.appointments_file, 'r') as f:
+            saved = json.load(f)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["providerId"], "dr-patel")
+
+    def test_slot_taken_between_confirmation_prompt_and_yes_is_rejected(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        self.assertTrue(os.path.exists(self.pending_file))
+
+        # Someone else's booking lands in between - written directly to
+        # the isolated tmp appointments file, exactly as a second real
+        # booking would. This is the exact race Step 3 is meant to close.
+        with open(self.appointments_file, 'w') as f:
+            json.dump(
+                [{"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+                  "time": "10:00", "status": "booked"}],
+                f,
+            )
+
+        response = self.post_webhook("YesIntent")
+        data = response.get_json()
+        text = data["messages"][0]["content"]["text"]
+
+        self.assertTrue(data["success"])
+        self.assertEqual(data["messages"][0]["type"], "text")
+        self.assertIn("no longer available", text)
+
+    def test_conflicting_appointment_is_not_overwritten_or_duplicated(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        conflicting = [{"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+                         "time": "10:00", "status": "booked"}]
+        with open(self.appointments_file, 'w') as f:
+            json.dump(conflicting, f)
+
+        self.post_webhook("YesIntent")
+
+        with open(self.appointments_file, 'r') as f:
+            saved = json.load(f)
+        self.assertEqual(saved, conflicting)
+
+    def test_pending_remains_for_recovery_when_slot_is_rejected(self):
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+        )
+        with open(self.pending_file, 'r') as f:
+            pending_before = json.load(f)
+
+        with open(self.appointments_file, 'w') as f:
+            json.dump(
+                [{"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+                  "time": "10:00", "status": "booked"}],
+                f,
+            )
+
+        self.post_webhook("YesIntent")
+
+        self.assertTrue(os.path.exists(self.pending_file))
+        with open(self.pending_file, 'r') as f:
+            pending_after = json.load(f)
+        self.assertEqual(pending_after, pending_before)
+
+    def test_pending_missing_provider_id_is_rejected_safely_not_guessed(self):
+        # Simulates a stale/legacy pending record predating Step 2's
+        # providerId field - never produced by the current
+        # _handle_book_appointment, but must still be handled
+        # deterministically (never by guessing a provider) if one is
+        # ever found on disk.
+        self._write_pending({"name": "Test Patient", "date": "2026-12-28", "time": "10:00"})
+
+        response = self.post_webhook("YesIntent")
+        data = response.get_json()
+
+        self.assertTrue(data["success"])
+        self.assertEqual(data["messages"][0]["type"], "text")
+        self.assertIn("missing", data["messages"][0]["content"]["text"].lower())
+        self.assertFalse(os.path.exists(self.appointments_file))
+        self.assertTrue(os.path.exists(self.pending_file))
+
+    def test_pending_missing_date_is_rejected_safely(self):
+        self._write_pending({"name": "Test Patient", "providerId": "dr-patel", "time": "10:00"})
+
+        response = self.post_webhook("YesIntent")
+        data = response.get_json()
+
+        self.assertIn("missing", data["messages"][0]["content"]["text"].lower())
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_pending_missing_time_is_rejected_safely(self):
+        self._write_pending({"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"})
+
+        response = self.post_webhook("YesIntent")
+        data = response.get_json()
+
+        self.assertIn("missing", data["messages"][0]["content"]["text"].lower())
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_pending_with_unknown_provider_id_is_rejected_safely_not_a_500(self):
+        # A providerId that no longer resolves to a real provider (e.g.
+        # removed from providers.json since the pending record was
+        # written) must go through the existing AvailabilityError
+        # handling, not crash or leak internals.
+        self._write_pending(
+            {"name": "Test Patient", "providerId": "does-not-exist", "date": "2026-12-28", "time": "10:00"}
+        )
+
+        response = self.post_webhook("YesIntent")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+
+        self.assertTrue(data["success"])
+        self.assertEqual(data["messages"][0]["type"], "text")
+        text = data["messages"][0]["content"]["text"]
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("AvailabilityError", text)
+        self.assertFalse(os.path.exists(self.appointments_file))
+        self.assertTrue(os.path.exists(self.pending_file))
+
+
 class BookingErrorHandlingTest(BookingFlowTestCase):
     def test_malformed_date_produces_a_safe_reprompt_not_a_500(self):
         response = self.post_webhook(

@@ -423,9 +423,54 @@ def _handle_book_appointment(parameters):
 
 
 def _handle_yes_intent():
+    """Phase 6.1, Slice 3, Step 3 added a final availability re-check
+    immediately before the persist step below, closing the race where the
+    slot shown/validated during booking (Step 2) gets taken by a
+    different booking before this confirmation arrives. Never trusts the
+    earlier check - always re-verifies the exact providerId/date/time
+    fresh, via the same availability_service.is_slot_available() used
+    during booking, and never silently guesses a provider for a pending
+    record that's missing one (see the guard below) - that record simply
+    cannot be confirmed by this flow.
+
+    On any failure (missing fields, a data problem availability_service
+    itself refuses to guess about, or a genuinely-taken slot), the
+    pending record is deliberately left in place - only a successful
+    confirmation (or an explicit "no") clears it - and no appointment is
+    appended.
+    """
     if os.path.exists(PENDING_FILE):
         with open(PENDING_FILE, 'r') as f:
             appointment = json.load(f)
+
+        provider_id = appointment.get('providerId')
+        date = appointment.get('date')
+        time = appointment.get('time')
+
+        if not provider_id or not date or not time:
+            logger.warning("booking confirmation rejected - pending record is missing required fields")
+            text = (
+                "Sorry, I couldn't confirm that appointment because some details are missing. "
+                "Please choose a provider, date, and time again."
+            )
+            return [response_model.text_message(text)]
+
+        try:
+            slot_still_available = availability_service.is_slot_available(provider_id, date, time)
+        except availability_service.AvailabilityError as e:
+            logger.warning(
+                "booking confirmation availability re-check failed provider_id=%s exception_type=%s",
+                provider_id, type(e).__name__,
+            )
+            text = "Sorry, I couldn't confirm that appointment right now. Please choose another time or date."
+            return [response_model.text_message(text)]
+
+        if not slot_still_available:
+            text = (
+                "Sorry, that time is no longer available - it looks like it was just booked. "
+                "Please choose another time or date."
+            )
+            return [response_model.text_message(text)]
 
         appointments = []
         if os.path.exists(APPOINTMENTS_FILE):
