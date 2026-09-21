@@ -141,24 +141,38 @@ def handle_webhook_request(payload, request_id=None):
     )
 
 
-def _pending_transaction_count():
+def _pending_transaction_count(exclude=None):
     """Counts how many of the three mutually-exclusive global pending
     transaction files currently exist (booking, cancellation, update).
-    Normally 0 or 1 - both _handle_cancel_appointment and
-    _handle_update_appointment call this exact function at the top of
-    their own body and refuse to create/overwrite their pending file if
-    it returns anything greater than 0 (i.e. if ANY pending transaction
-    already exists, including one of their own type) - see their
-    docstrings. handle_webhook_request uses the same function to fail
-    closed on a bare "yes"/"no" if more than one somehow exists at once
-    anyway (e.g. a leaked/partial state from a bug), rather than guessing
-    which the user meant. Creation time and confirmation time therefore
-    apply the identical mutual-exclusion rule, via the identical count.
+    Normally 0 or 1 - _handle_cancel_appointment and
+    _handle_update_appointment both call this exact function (with no
+    `exclude`) at the top of their own body and refuse to create/
+    overwrite their pending file if it returns anything greater than 0
+    (i.e. if ANY pending transaction already exists, including one of
+    their own type) - see their docstrings. handle_webhook_request uses
+    the same function (also with no `exclude`) to fail closed on a bare
+    "yes"/"no" if more than one somehow exists at once anyway (e.g. a
+    leaked/partial state from a bug), rather than guessing which the user
+    meant.
+
+    `exclude`, if given, is one of the three PENDING_*_FILE path
+    constants to leave out of the count. Used only by
+    _handle_book_appointment's own guard (see its docstring) to ask "does
+    a *different* pending transaction exist" by passing
+    exclude=PENDING_FILE - unlike cancel/update (single-shot-then-confirm,
+    where re-entering with their own pending file already present always
+    means a genuinely new, competing attempt), booking is inherently
+    multi-turn and PENDING_FILE is only ever written once a full
+    name/provider/date/slot has been resolved, so re-entering this
+    function with PENDING_FILE already present is exactly what a
+    legitimate in-progress booking continuing (or re-confirming the same
+    resolved slot) looks like - not a new, competing booking. Every other
+    caller omits `exclude`, so their behavior is unchanged.
     """
     return sum([
-        os.path.exists(PENDING_FILE),
-        os.path.exists(PENDING_CANCELLATION_FILE),
-        os.path.exists(PENDING_UPDATE_FILE),
+        os.path.exists(PENDING_FILE) if exclude != PENDING_FILE else False,
+        os.path.exists(PENDING_CANCELLATION_FILE) if exclude != PENDING_CANCELLATION_FILE else False,
+        os.path.exists(PENDING_UPDATE_FILE) if exclude != PENDING_UPDATE_FILE else False,
     ])
 
 
@@ -427,8 +441,30 @@ def _handle_book_appointment(parameters):
     decision made right here. This function still owns 100% of that
     validation - the return value only ever *labels* a decision already
     made above it, never adds a new one.
+
+    Booking, cancellation, and update pending state are mutually
+    exclusive (see PENDING_UPDATE_FILE's own comment and
+    _handle_cancel_appointment's/_handle_update_appointment's identical
+    guards): if a pending cancellation or pending update already exists,
+    this function refuses to continue - the caller is told to resolve the
+    existing one first. Deliberately checks
+    _pending_transaction_count(exclude=PENDING_FILE) rather than the bare
+    count every other caller uses: an existing pending BOOKING is not a
+    conflict with itself - see _pending_transaction_count's own docstring
+    for why excluding it here is required to keep ordinary multi-turn
+    booking (and re-confirming an already-resolved slot) working exactly
+    as before.
     """
     parameters = parameters or {}
+
+    if _pending_transaction_count(exclude=PENDING_FILE) > 0:
+        text = (
+            "You already have another appointment action waiting for confirmation. "
+            "Please reply \"yes\" or \"no\" to finish that first, then try booking "
+            "an appointment."
+        )
+        return [response_model.text_message(text)], None
+
     name = parameters.get('name')
     provider_choice = parameters.get('providerId')
     date = parameters.get('date')

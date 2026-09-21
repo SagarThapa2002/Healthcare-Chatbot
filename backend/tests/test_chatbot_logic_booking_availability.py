@@ -1079,39 +1079,34 @@ class CancellationFlowTest(BookingFlowTestCase):
         self.post_webhook("YesIntent")
         self.assertFalse(os.path.exists(self.pending_cancellation_file))
 
-    def test_pending_cancellation_does_not_interfere_with_booking_pending_state(self):
+    def test_pending_cancellation_refuses_a_new_booking_and_remains_unaffected(self):
         first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
         self.post_webhook("Cancel Appointment", {"id": first["id"]})
         self.assertTrue(os.path.exists(self.pending_cancellation_file))
         self.assertFalse(os.path.exists(self.pending_file))
 
-        # A brand-new booking flow started while the cancellation is
-        # pending must be completely unaffected.
-        self.post_webhook("Book Appointment", {"name": "Second Patient", "providerId": "dr-patel"})
-        confirm_booking = self.post_webhook(
-            "Book Appointment",
-            {"name": "Second Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "11:00"},
+        # Next slice: a brand-new booking attempt started while the
+        # cancellation is pending is now refused upfront, at creation time
+        # (see _handle_book_appointment's own guard) - it never reaches
+        # PENDING_FILE creation, so the two-pending-files scenario this
+        # test previously exercised can no longer arise via this path.
+        # The pending cancellation itself is left completely untouched.
+        rejected = self.post_webhook(
+            "Book Appointment", {"name": "Second Patient", "providerId": "dr-patel"}
         ).get_json()
-        self.assertIn("yes or no", confirm_booking["messages"][0]["content"]["text"])
-        self.assertTrue(os.path.exists(self.pending_file))
+        self.assertNotIn("bookingStage", rejected["context"])
+        self.assertIn(
+            "already have another appointment action", rejected["messages"][0]["content"]["text"]
+        )
+        self.assertFalse(os.path.exists(self.pending_file))
         self.assertTrue(os.path.exists(self.pending_cancellation_file))
 
-        # Phase 6.1 Slice B: pending booking/cancellation/update state is
-        # now treated as mutually exclusive, with no arbitrary priority
-        # between them (see handle_webhook_request's own comment) - if
-        # more than one somehow exists at once anyway, a bare "yes" fails
-        # closed instead of guessing which one the user meant. Neither
-        # pending file is touched, and neither appointment is modified.
+        # The original pending cancellation can still be confirmed normally.
         confirmed = self.post_webhook("YesIntent").get_json()
-        self.assertNotIn("cancellationStage", confirmed["context"])
-        self.assertNotIn("bookingStage", confirmed["context"])
-        self.assertIn("more than one action", confirmed["messages"][0]["content"]["text"].lower())
-        self.assertTrue(os.path.exists(self.pending_file))
-        self.assertTrue(os.path.exists(self.pending_cancellation_file))
-
+        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
         saved = self._read_appointments()
         first_after = next(a for a in saved if a["id"] == first["id"])
-        self.assertNotEqual(first_after.get("status"), "cancelled")
+        self.assertEqual(first_after["status"], "cancelled")
 
     def test_cancellation_refuses_to_start_when_pending_booking_exists(self):
         self.post_webhook("Book Appointment", {"name": "Booker", "providerId": "dr-patel"})
@@ -1181,6 +1176,134 @@ class CancellationFlowTest(BookingFlowTestCase):
         saved = self._read_appointments()
         first_after = next(a for a in saved if a["id"] == first["id"])
         self.assertEqual(first_after["status"], "cancelled")
+
+
+class BookingPendingTransactionMutualExclusionTest(BookingFlowTestCase):
+    """Next slice: _handle_book_appointment now refuses to start/continue
+    while a DIFFERENT pending transaction (cancellation or update)
+    exists, mirroring _handle_cancel_appointment's/_handle_update_appointment's
+    own guards - but deliberately excludes its own PENDING_FILE from the
+    check, so ordinary multi-turn booking (and re-confirming an
+    already-resolved slot) keeps working exactly as before.
+    """
+
+    def _book_and_confirm(self, name="Test Patient", date="2026-12-28", time="10:00"):
+        self.post_webhook(
+            "Book Appointment", {"name": name, "providerId": "dr-patel", "date": date, "time": time}
+        )
+        booked = self.post_webhook("YesIntent").get_json()
+        return booked["messages"][0]["content"]["appointment"]
+
+    def _read_appointments(self):
+        with open(self.appointments_file, 'r') as f:
+            return json.load(f)
+
+    def test_booking_refused_when_pending_cancellation_exists(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+
+        response = self.post_webhook("Book Appointment", {"name": "New Patient"}).get_json()
+        self.assertNotIn("bookingStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_booking_refused_when_pending_update_exists(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Update Appointment", {"id": appointment["id"], "date": "2026-12-30"})
+        self.assertTrue(os.path.exists(self.pending_update_file))
+
+        response = self.post_webhook("Book Appointment", {"name": "New Patient"}).get_json()
+        self.assertNotIn("bookingStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_rejected_booking_attempt_does_not_overwrite_existing_pending_cancellation(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+        with open(self.pending_cancellation_file, 'r') as f:
+            pending_before = f.read()
+
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "New Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "11:00"},
+        )
+
+        with open(self.pending_cancellation_file, 'r') as f:
+            pending_after = f.read()
+        self.assertEqual(pending_before, pending_after)
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_rejected_booking_attempt_does_not_mutate_appointments(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Update Appointment", {"id": appointment["id"], "date": "2026-12-30"})
+
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "New Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "11:00"},
+        )
+
+        saved = self._read_appointments()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], appointment["id"])
+        self.assertEqual(saved[0]["date"], "2026-12-28")
+
+    def test_existing_pending_booking_continues_normally_through_remaining_stages(self):
+        # Reaches the 'provider' stage - no PENDING_FILE exists yet, since
+        # it's only written once name/provider/date/slot are all resolved.
+        response = self.post_webhook("Book Appointment", {"name": "Continuer"}).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "provider")
+        self.assertFalse(os.path.exists(self.pending_file))
+
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Continuer", "providerId": "dr-patel"}
+        ).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "date")
+
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Continuer", "providerId": "dr-patel", "date": "2026-12-28"},
+        ).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "slot")
+
+        # This call resolves the slot and writes PENDING_FILE for the
+        # first time - the guard (checking OTHER pending files only) must
+        # not interfere with this, its own transaction's first write.
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Continuer", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"},
+        ).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "confirm")
+        self.assertTrue(os.path.exists(self.pending_file))
+
+        # Re-sending the exact same, already-resolved confirm-stage
+        # parameters again (e.g. a retry) must not be blocked by its own
+        # existing PENDING_FILE - it re-validates and re-confirms normally.
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Continuer", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"},
+        ).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "confirm")
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been booked", confirmed["messages"][0]["content"]["text"])
+
+    def test_normal_booking_still_works_when_nothing_else_is_pending(self):
+        response = self.post_webhook(
+            "Book Appointment",
+            {"name": "Solo", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"},
+        ).get_json()
+        self.assertEqual(response["context"]["bookingStage"], "confirm")
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been booked", confirmed["messages"][0]["content"]["text"])
+        saved = self._read_appointments()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["name"], "Solo")
 
 
 if __name__ == '__main__':
