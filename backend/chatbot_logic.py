@@ -144,12 +144,16 @@ def handle_webhook_request(payload, request_id=None):
 def _pending_transaction_count():
     """Counts how many of the three mutually-exclusive global pending
     transaction files currently exist (booking, cancellation, update).
-    Normally 0 or 1 - see PENDING_UPDATE_FILE's own comment and
-    _handle_update_appointment's guard, which refuses to create a pending
-    update while a pending booking or cancellation already exists. Used by
-    handle_webhook_request to fail closed on a bare "yes"/"no" if more
-    than one somehow exists at once, rather than guessing which the user
-    meant.
+    Normally 0 or 1 - both _handle_cancel_appointment and
+    _handle_update_appointment call this exact function at the top of
+    their own body and refuse to create/overwrite their pending file if
+    it returns anything greater than 0 (i.e. if ANY pending transaction
+    already exists, including one of their own type) - see their
+    docstrings. handle_webhook_request uses the same function to fail
+    closed on a bare "yes"/"no" if more than one somehow exists at once
+    anyway (e.g. a leaked/partial state from a bug), rather than guessing
+    which the user meant. Creation time and confirmation time therefore
+    apply the identical mutual-exclusion rule, via the identical count.
     """
     return sum([
         os.path.exists(PENDING_FILE),
@@ -711,14 +715,17 @@ def _handle_update_appointment(parameters):
     place anything is actually written).
 
     Booking, cancellation, and update pending state are mutually
-    exclusive (see PENDING_UPDATE_FILE's own comment): if a pending
-    booking or cancellation already exists, no pending update is ever
-    created here - the caller is told to resolve the existing one first,
-    deterministically, rather than silently overwriting or racing it.
+    exclusive (see PENDING_UPDATE_FILE's own comment): if ANY pending
+    transaction already exists - including an existing pending update
+    itself - no pending update is ever created or overwritten here; the
+    caller is told to resolve the existing one first, deterministically,
+    rather than silently overwriting or racing it. Uses the same
+    _pending_transaction_count() the YesIntent/NoIntent dispatch uses, so
+    creation time and confirmation time apply the identical rule.
     """
     parameters = parameters or {}
 
-    if os.path.exists(PENDING_FILE) or os.path.exists(PENDING_CANCELLATION_FILE):
+    if _pending_transaction_count() > 0:
         text = (
             "You already have another appointment action waiting for confirmation. "
             "Please reply \"yes\" or \"no\" to finish that first, then try updating "
@@ -972,8 +979,28 @@ def _handle_cancel_appointment(parameters):
     Nothing is written to appointments.json here - only a pending
     cancellation record (PENDING_CANCELLATION_FILE) once exactly one
     active appointment has been safely identified.
+
+    Booking, cancellation, and update pending state are mutually
+    exclusive (see PENDING_UPDATE_FILE's own comment and
+    _handle_update_appointment's identical guard): if ANY pending
+    transaction already exists - including an existing pending
+    cancellation itself - no pending cancellation is ever created or
+    overwritten here; the caller is told to resolve the existing one
+    first, deterministically, rather than silently overwriting or racing
+    it. Uses the same _pending_transaction_count() the YesIntent/NoIntent
+    dispatch uses, so creation time and confirmation time apply the
+    identical rule.
     """
     parameters = parameters or {}
+
+    if _pending_transaction_count() > 0:
+        text = (
+            "You already have another appointment action waiting for confirmation. "
+            "Please reply \"yes\" or \"no\" to finish that first, then try cancelling "
+            "an appointment."
+        )
+        return [response_model.text_message(text)], None
+
     appointment_id = parameters.get('id')
     name = parameters.get('name')
 

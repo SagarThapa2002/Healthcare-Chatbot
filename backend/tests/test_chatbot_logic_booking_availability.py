@@ -1113,6 +1113,75 @@ class CancellationFlowTest(BookingFlowTestCase):
         first_after = next(a for a in saved if a["id"] == first["id"])
         self.assertNotEqual(first_after.get("status"), "cancelled")
 
+    def test_cancellation_refuses_to_start_when_pending_booking_exists(self):
+        self.post_webhook("Book Appointment", {"name": "Booker", "providerId": "dr-patel"})
+        self.post_webhook(
+            "Book Appointment",
+            {"name": "Booker", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"},
+        )
+        self.assertTrue(os.path.exists(self.pending_file))
+
+        response = self.post_webhook("Cancel Appointment", {"name": "Anyone"}).get_json()
+        self.assertNotIn("cancellationStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+        self.assertTrue(os.path.exists(self.pending_file))
+
+    def test_cancellation_refuses_to_start_when_pending_update_exists(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Update Appointment", {"id": appointment["id"], "date": "2026-12-30"})
+        self.assertTrue(os.path.exists(self.pending_update_file))
+
+        response = self.post_webhook(
+            "Cancel Appointment", {"id": appointment["id"]}
+        ).get_json()
+        self.assertNotIn("cancellationStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+        self.assertTrue(os.path.exists(self.pending_update_file))
+
+        saved = self._read_appointments()
+        self.assertEqual(saved[0]["date"], "2026-12-28")
+
+    def test_cancellation_refuses_to_start_when_pending_cancellation_already_exists(self):
+        first = self._book_and_confirm(name="First", date="2026-12-28", time="09:00")
+        second = self._book_and_confirm(name="Second", date="2026-12-28", time="09:30")
+
+        self.post_webhook("Cancel Appointment", {"id": first["id"]})
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+        with open(self.pending_cancellation_file, 'r') as f:
+            pending_before = f.read()
+
+        response = self.post_webhook("Cancel Appointment", {"id": second["id"]}).get_json()
+        self.assertNotIn("cancellationStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+
+        # The FIRST pending cancellation must survive completely unchanged -
+        # the second, rejected attempt must not overwrite it.
+        with open(self.pending_cancellation_file, 'r') as f:
+            pending_after = f.read()
+        self.assertEqual(pending_before, pending_after)
+
+        # Neither appointment was mutated by the rejected second attempt.
+        saved = self._read_appointments()
+        first_after = next(a for a in saved if a["id"] == first["id"])
+        second_after = next(a for a in saved if a["id"] == second["id"])
+        self.assertNotEqual(first_after.get("status"), "cancelled")
+        self.assertNotEqual(second_after.get("status"), "cancelled")
+
+        # The original pending cancellation can still be confirmed normally.
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
+        saved = self._read_appointments()
+        first_after = next(a for a in saved if a["id"] == first["id"])
+        self.assertEqual(first_after["status"], "cancelled")
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -503,6 +503,44 @@ class UpdatePendingTransactionMutualExclusionTest(UpdateFlowTestCase):
         self.assertFalse(os.path.exists(self.pending_update_file))
         self.assertTrue(os.path.exists(self.pending_cancellation_file))
 
+    def test_update_refuses_to_start_when_pending_update_already_exists(self):
+        first = self._book_and_confirm(name="First", date="2026-12-28", time="09:00")
+        second = self._book_and_confirm(name="Second", date="2026-12-28", time="09:30")
+
+        self.post_webhook("Update Appointment", {"id": first["id"], "date": "2026-12-30"})
+        self.assertTrue(os.path.exists(self.pending_update_file))
+        with open(self.pending_update_file, 'r') as f:
+            pending_before = f.read()
+
+        response = self.post_webhook(
+            "Update Appointment", {"id": second["id"], "time": "10:00"}
+        ).get_json()
+        self.assertNotIn("updateStage", response["context"])
+        self.assertIn(
+            "already have another appointment action", response["messages"][0]["content"]["text"]
+        )
+
+        # The FIRST pending update must survive completely unchanged - the
+        # second, rejected attempt must not overwrite it.
+        with open(self.pending_update_file, 'r') as f:
+            pending_after = f.read()
+        self.assertEqual(pending_before, pending_after)
+
+        # Neither appointment was mutated by the rejected second attempt.
+        saved = self._read_appointments()
+        first_after = next(a for a in saved if a["id"] == first["id"])
+        second_after = next(a for a in saved if a["id"] == second["id"])
+        self.assertEqual(first_after["date"], "2026-12-28")
+        self.assertEqual(second_after["date"], "2026-12-28")
+        self.assertEqual(second_after["time"], "09:30")
+
+        # The original pending update can still be confirmed normally.
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been updated", confirmed["messages"][0]["content"]["text"])
+        saved = self._read_appointments()
+        first_after = next(a for a in saved if a["id"] == first["id"])
+        self.assertEqual(first_after["date"], "2026-12-30")
+
     def test_multiple_pending_transaction_files_fail_closed_on_yes(self):
         appointment = self._book_and_confirm(name="First", date="2026-12-28", time="09:00")
         self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
