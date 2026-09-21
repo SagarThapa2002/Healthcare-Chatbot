@@ -376,3 +376,169 @@ describe('provider-aware booking flow (Phase 6.1 Slice 3, Step 4)', () => {
     expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
   });
 });
+
+// Builds a fake Cancel Appointment (or its yes/no confirmation) envelope
+// with a given `cancellationStage`, matching
+// backend/response_model.py's success_response(..., cancellation_stage=...)
+// contract exactly - `cancellationStage` is omitted from `context` when
+// not given, the same way the real contract omits it. This is the ONLY
+// signal these tests use to drive the flow forward - never suggestions,
+// never message text.
+function envelopeWithCancellation(text, cancellationStage) {
+  return {
+    success: true,
+    error: null,
+    messages: [{ type: 'text', content: { text }, suggestions: [] }],
+    context: { intent: 'Cancel Appointment', ...(cancellationStage ? { cancellationStage } : {}) },
+    meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+  };
+}
+
+describe('cancellation flow (Phase 6.1 Slice A - frontend, context.cancellationStage only)', () => {
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  test('starting cancellation stores "identifier" - the next reply is routed as a cancellation identifier, not a fresh intent', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithCancellation("Sure - what's the ID or name on the appointment you'd like to cancel?", 'identifier')
+    );
+    await submitMessage(result, 'cancel my appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', {});
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithCancellation('Please confirm — cancel the appointment for Sagar on 2026-12-28 at 09:00? (yes or no)', 'confirm')
+    );
+    // Free text that would otherwise be classified as General FAQ must
+    // still be routed back into the cancellation flow, as a `name`.
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
+  });
+
+  test('a UUID-shaped identifier reply is sent as `id`, not `name` - without the frontend matching it against any appointment', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+
+    const uuid = 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d';
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'confirm'));
+    await submitMessage(result, uuid);
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { id: uuid });
+  });
+
+  test('identifier response advancing to "confirm": a bare "yes" reaches YesIntent (no separate confirmation API)', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Your appointment ... has been cancelled.', 'cancelled'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
+
+  test('confirm "yes" reaching "cancelled" resets local state - the next message is ordinary single-shot routing', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('... has been cancelled.', 'cancelled'));
+    await submitMessage(result, 'yes');
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('confirm "no" is sent via the existing NoIntent mechanism and resets local state per the backend response', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+
+    // _handle_cancel_confirm_no returns cancellation_stage=None (declining
+    // doesn't advance to any named stage) - the fake envelope below omits
+    // it, exactly like the real contract does.
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("No problem! I've left that appointment unchanged.", undefined));
+    await submitMessage(result, 'no');
+    expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {});
+
+    // Local state must have been cleared - the next message is ordinary
+    // routing, not misread as still awaiting a confirm/identifier reply.
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('a missing cancellationStage does not cause an inferred state transition (fail closed)', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    // No cancellationStage at all in the response context - e.g. the
+    // "not found" path in _handle_cancel_appointment, which returns None.
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("I couldn't find an appointment for Someone to cancel.", undefined));
+    await submitMessage(result, 'cancel my appointment');
+
+    // The next message must be routed as an ordinary fresh intent, not
+    // treated as an "identifier" or "confirm" reply.
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('an in-progress cancellation does not affect a subsequent, independent booking flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("I couldn't find an appointment for Ghost to cancel.", undefined));
+    await submitMessage(result, 'Ghost');
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await submitMessage(result, 'book an appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', {});
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithText('Thanks Sagar. Which provider would you like to see?\n1. Dr. Patel...', 'provider')
+    );
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar' });
+  });
+
+  test('normal YesIntent/NoIntent behavior is unchanged when there is no pending cancellation (no booking either)', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'no');
+    expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {});
+  });
+
+  test('regression: Cancel Appointment interrupting an active booking still stores cancellationStage - the next reply stays in the cancellation flow', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    // Get a booking into progress (stage: 'name').
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await submitMessage(result, 'book an appointment');
+
+    // Interrupt it with a cancellation.
+    callBackend.mockResolvedValueOnce(
+      envelopeWithCancellation("Sure - what's the ID or name on the appointment you'd like to cancel?", 'identifier')
+    );
+    await submitMessage(result, 'cancel my appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', {});
+
+    // The next free-text reply must stay in the cancellation flow (sent
+    // as `name`), not be routed as General FAQ or as booking's own
+    // 'name' stage input.
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
+  });
+});

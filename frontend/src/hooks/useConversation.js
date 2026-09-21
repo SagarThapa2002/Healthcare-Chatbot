@@ -25,11 +25,31 @@ function prefixFirstMessage(envelope, prefix) {
   };
 }
 
+// The literal shape of an appointment id (str(uuid.uuid4()) - see
+// backend/chatbot_logic.py's _handle_yes_intent and
+// backend/response_model.py's _new_request_id, the same convention). Used
+// only to pick which of the backend's two independent lookup keys (`id`
+// vs `name` - see _handle_cancel_appointment's own docstring) an
+// identifier-stage reply is sent under. This recognizes a fixed, stable
+// SYNTAX only - it never searches, matches, or disambiguates appointment
+// data, so it does not reproduce the backend's own lookup logic.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [booking, setBooking] = useState(EMPTY_BOOKING);
+  // The cancellation flow's ENTIRE local state: which stage the backend
+  // last reported it's waiting on. Unlike `booking`, there are no field
+  // values to accumulate turn over turn (every cancellation reply is a
+  // single-shot forward to the backend), so this is just one value - and
+  // it is set ONLY from context.cancellationStage on a response, never
+  // inferred from suggestions, message text, or any other field (see
+  // response_model.success_response's docstring: cancellationStage is the
+  // sole structural authority for this flow, the same role bookingStage
+  // plays for booking).
+  const [cancellationStage, setCancellationStage] = useState(null);
 
   // For plain client-side prompts (validation messages, etc.) that never
   // went through the backend, so they render with the same shape as a
@@ -84,6 +104,18 @@ function useConversation() {
           setBooking(EMPTY_BOOKING);
           const parameters = otherIntent === 'Symptom Check' ? { symptom: text } : {};
           const envelope = await callBackend(otherIntent, parameters);
+          // An interruption into Cancel Appointment starts the cancellation
+          // flow exactly like the plain (non-interrupting) entry point
+          // below does - read only from context.cancellationStage, never
+          // from suggestions/prose/message count. Every other interrupting
+          // intent (Symptom Check, View Appointments, Update Appointment)
+          // is unaffected - none of them ever set this.
+          if (otherIntent === 'Cancel Appointment') {
+            const nextStage = envelope.context?.cancellationStage;
+            if (nextStage === 'identifier' || nextStage === 'confirm' || nextStage === 'cancelled') {
+              setCancellationStage(nextStage);
+            }
+          }
           sayEnvelope(prefixFirstMessage(envelope, '(Cancelled your in-progress booking.) '));
           return;
         }
@@ -185,7 +217,49 @@ function useConversation() {
         return;
       }
 
-      // No booking in progress - ordinary single-shot routing.
+      // Cancellation's local state machine: reached only when no booking
+      // is in progress (the check above always returns first), so an
+      // active booking is never affected by cancellation state and vice
+      // versa. Mirrors booking's own "stage truthy -> this reply answers
+      // that flow" shape, but with exactly the two stages that need a
+      // reply from the user - "cancelled" needs no further input and is
+      // simply the value cancellationStage is set to (see below), never
+      // branched on here.
+      if (cancellationStage === 'confirm') {
+        const answer = text.trim().toLowerCase();
+
+        if (answer === 'yes') {
+          const envelope = await callBackend('YesIntent', {});
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
+          sayEnvelope(envelope);
+          return;
+        }
+        if (answer === 'no') {
+          const envelope = await callBackend('NoIntent', {});
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
+          sayEnvelope(envelope);
+          return;
+        }
+
+        sayText('Please reply "yes" to confirm the cancellation, or "no" to keep the appointment.');
+        return;
+      }
+
+      if (cancellationStage === 'identifier') {
+        if (!text.trim()) {
+          sayText("Please tell me the ID or name of the appointment you'd like to cancel.");
+          return;
+        }
+
+        const trimmed = text.trim();
+        const parameters = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
+        const envelope = await callBackend('Cancel Appointment', parameters);
+        setCancellationStage(envelope.context?.cancellationStage ?? null);
+        sayEnvelope(envelope);
+        return;
+      }
+
+      // No booking or cancellation in progress - ordinary single-shot routing.
       const intent = detectIntent(text);
       if (intent === 'Book Appointment') {
         const fields = extractInitialBookingFields(text);
@@ -213,7 +287,11 @@ function useConversation() {
         } else if (intent === 'General FAQ') {
           parameters = { message: text };
         }
-        sayEnvelope(await callBackend(intent, parameters));
+        const envelope = await callBackend(intent, parameters);
+        if (intent === 'Cancel Appointment') {
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
+        }
+        sayEnvelope(envelope);
       }
     } catch (err) {
       console.error(err);
