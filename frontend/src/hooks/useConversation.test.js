@@ -375,6 +375,49 @@ describe('provider-aware booking flow (Phase 6.1 Slice 3, Step 4)', () => {
 
     expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
   });
+
+  test('an accepted booking start (bookingStage present) activates local booking state', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithText('Sure, may I have your name for the appointment?', 'name')
+    );
+    await submitMessage(result, 'book an appointment');
+
+    // The next message must be treated as answering the 'name' stage -
+    // not routed as a fresh, unrelated intent - proving the local
+    // booking state was actually activated by the accepted response.
+    callBackend.mockResolvedValueOnce(
+      envelopeWithText('Thanks Sagar. Which provider would you like to see?\n1. Dr. Patel...', 'provider')
+    );
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar' });
+  });
+
+  test('regression: a refused booking start (no bookingStage) does NOT activate local booking state', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    // Matches chatbot_logic.py's _handle_book_appointment mutual-exclusion
+    // guard: refused because another transaction (cancellation/update) is
+    // already pending - reports no bookingStage at all, exactly like the
+    // real contract omits it here (see envelopeWithText's own docstring).
+    callBackend.mockResolvedValueOnce(
+      envelopeWithText(
+        'You already have another appointment action waiting for confirmation. '
+        + 'Please reply "yes" or "no" to finish that first, then try booking an appointment.',
+        undefined,
+      )
+    );
+    await submitMessage(result, 'book an appointment');
+
+    // The next message must NOT be swallowed by a fabricated local
+    // booking state - it must route as ordinary, unrelated single-shot
+    // intent (e.g. a bare "yes" reaches YesIntent directly, not
+    // misread as a name-stage reply).
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
 });
 
 // Builds a fake Cancel Appointment (or its yes/no confirmation) envelope

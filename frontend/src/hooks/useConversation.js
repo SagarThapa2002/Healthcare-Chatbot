@@ -360,7 +360,7 @@ function useConversation() {
       const intent = detectIntent(text);
       if (intent === 'Book Appointment') {
         const fields = extractInitialBookingFields(text);
-        const next = {
+        const attempted = {
           active: true,
           name: fields.name || null,
           // Never extracted from free text - see
@@ -369,8 +369,29 @@ function useConversation() {
           date: fields.date || null,
           time: fields.time || null,
         };
-        setBooking(next);
-        sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
+        const envelope = await callBackend('Book Appointment', bookingParams(attempted));
+        // Only actually enter the booking state machine if the backend's
+        // response proves this attempt was accepted - context.bookingStage
+        // is the backend's own structural report of which stage it's now
+        // waiting on (see response_model.success_response's docstring).
+        // _handle_book_appointment (chatbot_logic.py) returns a real stage
+        // ("name", "provider", "date", "slot", or "confirm") on every
+        // accepted path, and omits it entirely (None) on its own
+        // mutual-exclusion refusal - a pending cancellation or update
+        // already exists (see its own guard) - so any non-empty
+        // bookingStage here means genuinely accepted. This mirrors the
+        // same "commit only on backend-confirmed stage" discipline the
+        // provider/slot stages below already use, and the same principle
+        // cancellationStage/update.stage already apply at their own
+        // fresh-start entry points: never fabricate local state the
+        // backend didn't actually start. If refused, `booking` is left
+        // exactly as it was (still EMPTY_BOOKING here, since this branch
+        // only runs when no booking is already active) rather than
+        // optimistically marking one active.
+        if (envelope.context?.bookingStage) {
+          setBooking(attempted);
+        }
+        sayEnvelope(envelope);
       } else {
         // General FAQ is the sole "none confidence" / unclassified fallback
         // in classifyIntent (see conversation/intent.js) - sending the raw
