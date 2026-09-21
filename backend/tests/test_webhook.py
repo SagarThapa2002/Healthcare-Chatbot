@@ -19,7 +19,12 @@ class WebhookTestCase(unittest.TestCase):
     _handle_book_appointment calls into availability_service for
     date/slot availability checks, so both must be patched or that
     "never read from the real file" guarantee above would be broken for
-    every booking test in this class.
+    every booking test in this class. PENDING_CANCELLATION_FILE/
+    PENDING_UPDATE_FILE must also be patched - handle_webhook_request
+    checks their existence on every YesIntent/NoIntent to decide whether
+    to route to the cancellation/update confirm handlers, so leaving
+    either unpatched would have that check silently hit the real repo
+    path instead of this isolated one.
     """
 
     def setUp(self):
@@ -28,17 +33,29 @@ class WebhookTestCase(unittest.TestCase):
 
         self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
+        self.pending_cancellation_file = os.path.join(self.tmp_dir.name, 'pending_cancellation.json')
+        self.pending_update_file = os.path.join(self.tmp_dir.name, 'pending_update.json')
 
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_pending_cancellation = patch.object(
+            chatbot_logic, 'PENDING_CANCELLATION_FILE', self.pending_cancellation_file
+        )
+        patcher_pending_update = patch.object(
+            chatbot_logic, 'PENDING_UPDATE_FILE', self.pending_update_file
+        )
         patcher_availability_appointments = patch.object(
             availability_service, 'APPOINTMENTS_FILE', self.appointments_file
         )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_pending_cancellation.start()
+        patcher_pending_update.start()
         patcher_availability_appointments.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_pending_cancellation.stop)
+        self.addCleanup(patcher_pending_update.stop)
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
@@ -170,20 +187,34 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
 
         self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
+        self.pending_cancellation_file = os.path.join(self.tmp_dir.name, 'pending_cancellation.json')
+        self.pending_update_file = os.path.join(self.tmp_dir.name, 'pending_update.json')
 
         # Both chatbot_logic's and availability_service's independent
         # APPOINTMENTS_FILE constants must be patched - see
-        # WebhookTestCase's setUp docstring above for why.
+        # WebhookTestCase's setUp docstring above for why. Same for
+        # PENDING_CANCELLATION_FILE/PENDING_UPDATE_FILE (also explained
+        # there).
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_pending_cancellation = patch.object(
+            chatbot_logic, 'PENDING_CANCELLATION_FILE', self.pending_cancellation_file
+        )
+        patcher_pending_update = patch.object(
+            chatbot_logic, 'PENDING_UPDATE_FILE', self.pending_update_file
+        )
         patcher_availability_appointments = patch.object(
             availability_service, 'APPOINTMENTS_FILE', self.appointments_file
         )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_pending_cancellation.start()
+        patcher_pending_update.start()
         patcher_availability_appointments.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_pending_update.stop)
+        self.addCleanup(patcher_pending_cancellation.stop)
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
@@ -218,7 +249,10 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         self.assertIsNone(data["error"])
         self.assertEqual(data["messages"][0]["type"], "text")
         self.assertIn("name", data["messages"][0]["content"]["text"].lower())
-        self.assertEqual(data["context"], {"intent": "Update Appointment"})
+        # Phase 6.1 Slice B: update is now a multi-turn, ID-preferring
+        # flow - asking for an identifier reports updateStage "identifier"
+        # (see response_model.success_response).
+        self.assertEqual(data["context"], {"intent": "Update Appointment", "updateStage": "identifier"})
         self.assertEqual(data["meta"]["schemaVersion"], "1.0")
 
     def test_cancel_appointment_without_name_does_not_crash(self):
@@ -234,7 +268,10 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         self.assertIsNone(data["error"])
         self.assertEqual(data["messages"][0]["type"], "text")
         self.assertIn("name", data["messages"][0]["content"]["text"].lower())
-        self.assertEqual(data["context"], {"intent": "Cancel Appointment"})
+        # Next Phase 6.1 slice: cancellation is now a multi-turn,
+        # ID-preferring flow - asking for an identifier reports
+        # cancellationStage "identifier" (see response_model.success_response).
+        self.assertEqual(data["context"], {"intent": "Cancel Appointment", "cancellationStage": "identifier"})
         self.assertEqual(data["meta"]["schemaVersion"], "1.0")
 
     def test_update_appointment_without_parameters_key_does_not_crash(self):
@@ -258,22 +295,38 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         self.assertIn("name", data["messages"][0]["content"]["text"].lower())
 
     def test_update_appointment_with_valid_name_still_updates(self):
+        # Phase 6.1 Slice B: update now requires explicit confirmation -
+        # a unique name still resolves unambiguously, and the proposed new
+        # date is validated, but nothing is written until an explicit
+        # "yes". "2027-01-04" is a Monday - dr-patel's real, synthetic
+        # availability (see BookingFlowTestCase's own docstring for this
+        # data) - so the unchanged 10:00 time from _book_and_confirm still
+        # lands on a valid, open slot for that provider.
         self._book_and_confirm()
 
-        data = self.post_webhook(
-            "Update Appointment", {"name": "Test Patient", "date": "2027-01-02"}
+        identify = self.post_webhook(
+            "Update Appointment", {"name": "Test Patient", "date": "2027-01-04"}
         ).get_json()
+        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+
+        data = self.post_webhook("YesIntent").get_json()
 
         self.assertTrue(data["success"])
         self.assertIn("has been updated", data["messages"][0]["content"]["text"])
 
     def test_cancel_appointment_with_valid_name_still_cancels(self):
+        # Next Phase 6.1 slice: cancellation now requires explicit
+        # confirmation - a unique name still resolves unambiguously, but
+        # an explicit "yes" is required before anything changes.
         self._book_and_confirm()
 
-        data = self.post_webhook("Cancel Appointment", {"name": "Test Patient"}).get_json()
+        identify = self.post_webhook("Cancel Appointment", {"name": "Test Patient"}).get_json()
+        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+
+        data = self.post_webhook("YesIntent").get_json()
 
         self.assertTrue(data["success"])
-        self.assertIn("has been successfully canceled", data["messages"][0]["content"]["text"])
+        self.assertIn("has been cancelled", data["messages"][0]["content"]["text"])
 
     def test_update_appointment_with_unmatched_name_reports_not_found_not_a_crash(self):
         self._book_and_confirm()

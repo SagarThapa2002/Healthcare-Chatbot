@@ -33,6 +33,20 @@ logger = logging.getLogger(__name__)
 
 APPOINTMENTS_FILE = os.path.join(os.path.dirname(__file__), 'appointments.json')
 PENDING_FILE = os.path.join(os.path.dirname(__file__), 'pending_appointments.json')
+# Deliberately a separate file from PENDING_FILE above - a pending
+# cancellation and a pending booking are unrelated flows and must never
+# share or collide over the same global slot. Same known limitation as
+# PENDING_FILE: a single global file, no per-session scoping, no file
+# locking - not solved here, only documented (see
+# backend/PROVIDER_AVAILABILITY_NOTES.md).
+PENDING_CANCELLATION_FILE = os.path.join(os.path.dirname(__file__), 'pending_cancellation.json')
+# Phase 6.1 Slice B: a pending update is a third, independent global slot -
+# same limitation as the two above (single global file, no per-session
+# scoping, no file locking). Booking, cancellation, and update pending
+# state are treated as MUTUALLY EXCLUSIVE (see _handle_update_appointment's
+# own guard and _pending_transaction_count() below), rather than given an
+# arbitrary priority order the way a two-way tie would otherwise need.
+PENDING_UPDATE_FILE = os.path.join(os.path.dirname(__file__), 'pending_update.json')
 
 
 def _read_appointments_raw():
@@ -65,19 +79,52 @@ def handle_webhook_request(payload, request_id=None):
     # leaves it None, so response_model.success_response() omits
     # `bookingStage` from `context` for them entirely (see its docstring).
     booking_stage = None
+    # Same idea, for the cancel-by-ID flow - see success_response's
+    # docstring. Only Cancel Appointment / a YesIntent-or-NoIntent that
+    # resolves to a pending cancellation (see below) ever set this.
+    cancellation_stage = None
+    # Same idea again, for Phase 6.1 Slice B's update-by-ID flow. Only
+    # Update Appointment / a YesIntent-or-NoIntent that resolves to a
+    # pending update (see below) ever set this.
+    update_stage = None
 
     if intent == "Symptom Check":
         messages = _handle_symptom_check(parameters)
     elif intent == "Book Appointment":
         messages, booking_stage = _handle_book_appointment(parameters)
     elif intent == "YesIntent":
-        messages, booking_stage = _handle_yes_intent()
+        # Booking, cancellation, and update pending state are mutually
+        # exclusive (see PENDING_UPDATE_FILE's own comment and
+        # _handle_update_appointment's own guard) - normally at most one
+        # of the three pending files exists at a time, and this simply
+        # routes to whichever one it is. If more than one somehow exists
+        # anyway (a leaked/partial state from an earlier bug, not a
+        # reachable outcome of normal use), this deliberately does not
+        # guess which one the user meant - it fails closed with a generic
+        # message instead. _handle_yes_intent's / _handle_cancel_confirm_yes's
+        # own bodies are untouched either way - this only decides which
+        # handler a bare "yes" reaches.
+        if _pending_transaction_count() > 1:
+            messages = _handle_ambiguous_pending_transactions()
+        elif os.path.exists(PENDING_UPDATE_FILE):
+            messages, update_stage = _handle_update_confirm_yes()
+        elif os.path.exists(PENDING_CANCELLATION_FILE):
+            messages, cancellation_stage = _handle_cancel_confirm_yes()
+        else:
+            messages, booking_stage = _handle_yes_intent()
     elif intent == "NoIntent":
-        messages = _handle_no_intent()
+        if _pending_transaction_count() > 1:
+            messages = _handle_ambiguous_pending_transactions()
+        elif os.path.exists(PENDING_UPDATE_FILE):
+            messages, update_stage = _handle_update_confirm_no()
+        elif os.path.exists(PENDING_CANCELLATION_FILE):
+            messages, cancellation_stage = _handle_cancel_confirm_no()
+        else:
+            messages = _handle_no_intent()
     elif intent == "Update Appointment":
-        messages = _handle_update_appointment(parameters)
+        messages, update_stage = _handle_update_appointment(parameters)
     elif intent == "Cancel Appointment":
-        messages = _handle_cancel_appointment(parameters)
+        messages, cancellation_stage = _handle_cancel_appointment(parameters)
     elif intent == "View Appointments":
         messages = _handle_view_appointments()
     elif intent == "General FAQ":
@@ -88,8 +135,38 @@ def handle_webhook_request(payload, request_id=None):
         )]
 
     return response_model.success_response(
-        messages, intent=intent, request_id=request_id, booking_stage=booking_stage
+        messages, intent=intent, request_id=request_id,
+        booking_stage=booking_stage, cancellation_stage=cancellation_stage,
+        update_stage=update_stage,
     )
+
+
+def _pending_transaction_count():
+    """Counts how many of the three mutually-exclusive global pending
+    transaction files currently exist (booking, cancellation, update).
+    Normally 0 or 1 - see PENDING_UPDATE_FILE's own comment and
+    _handle_update_appointment's guard, which refuses to create a pending
+    update while a pending booking or cancellation already exists. Used by
+    handle_webhook_request to fail closed on a bare "yes"/"no" if more
+    than one somehow exists at once, rather than guessing which the user
+    meant.
+    """
+    return sum([
+        os.path.exists(PENDING_FILE),
+        os.path.exists(PENDING_CANCELLATION_FILE),
+        os.path.exists(PENDING_UPDATE_FILE),
+    ])
+
+
+def _handle_ambiguous_pending_transactions():
+    logger.warning(
+        "multiple pending transactional files exist at once - failing closed on YesIntent/NoIntent"
+    )
+    text = (
+        "Something went wrong - more than one action is waiting for confirmation. "
+        "Please try again in a moment."
+    )
+    return [response_model.text_message(text)]
 
 
 def _handle_symptom_check(parameters):
@@ -537,70 +614,505 @@ def _handle_no_intent():
     return [response_model.text_message(text)]
 
 
-def _handle_update_appointment(parameters):
-    name = (parameters or {}).get('name')
-    if not name:
-        return [response_model.text_message(
-            "Sure - what's the name on the appointment you'd like to update?"
-        )]
+_UPDATE_STAGE_IDENTIFIER = "identifier"
+_UPDATE_STAGE_FIELDS = "fields"
+_UPDATE_STAGE_CONFIRM = "confirm"
+_UPDATE_STAGE_UPDATED = "updated"
 
+
+def _matches_pending_update(appointment, pending):
+    """Re-identifies the exact appointment a pending update refers to,
+    without ever falling back to "first matching name" - mirrors
+    _matches_pending_cancellation's own reasoning exactly. Prefers the
+    stable `id` when the pending record has one; for a legacy no-id
+    record, requires an exact match on name AND originalDate AND
+    originalTime together (all three captured verbatim from the original
+    record at selection time, not typed by the user, and named
+    "original*" here specifically so they're never confused with the
+    pending record's own newDate/newTime - the values being applied).
+    """
+    if 'id' in pending:
+        return appointment.get('id') == pending['id']
+    return (
+        appointment.get('name') == pending.get('name')
+        and appointment.get('date') == pending.get('originalDate')
+        and appointment.get('time') == pending.get('originalTime')
+    )
+
+
+def _check_update_availability(appointment, appointments, check_date, check_time):
+    """Validates a proposed (possibly partial) date/time change for
+    `appointment` against availability_service, with `appointment` itself
+    excluded from its own conflict check (by identity, via `is`) - without
+    this, an update that doesn't actually change the slot would always
+    "conflict" with itself. A legacy appointment with no `providerId`
+    can't be meaningfully checked against any provider's schedule (see
+    availability_service.py's own documented convention: a missing
+    providerId is never treated as a conflict for a provider-specific
+    query) - this function skips validation entirely for that case and
+    always reports "ok", matching that convention.
+
+    Returns (ok, error_text) - `error_text` is a ready-to-show, safe
+    message and is only non-None when `ok` is False. Never raises: an
+    AvailabilityError from the underlying check is caught and turned into
+    an "ok=False" outcome with a safe fallback message, matching this
+    module's existing convention for date/slot validation elsewhere
+    (_handle_book_appointment, _handle_yes_intent).
+    """
+    provider_id = appointment.get('providerId')
+    if not provider_id:
+        return True, None
+
+    try:
+        other_appointments = [a for a in appointments if a is not appointment]
+        slot_ok = availability_service.is_slot_available(
+            provider_id, check_date, check_time, appointments=other_appointments,
+        )
+    except availability_service.AvailabilityError as e:
+        logger.warning(
+            "update availability check failed provider_id=%s exception_type=%s",
+            provider_id, type(e).__name__,
+        )
+        return False, (
+            "I couldn't check availability for that date/time. Could you give a date in "
+            "YYYY-MM-DD format and a time in HH:MM format?"
+        )
+
+    if not slot_ok:
+        return False, (
+            f"Sorry, {check_date} at {check_time} isn't available for that provider. "
+            "Could you choose a different date or time?"
+        )
+
+    return True, None
+
+
+def _handle_update_appointment(parameters):
+    """IDENTIFIER -> FIELDS -> CONFIRM -> UPDATED.
+
+    Phase 6.1 Slice B. Replaces the previous immediate-mutation,
+    name-only, unconfirmed update with a safe, confirmed, ID-preferring
+    flow. Returns (messages, update_stage) - see
+    response_model.success_response's docstring for the stage vocabulary.
+
+    Lookup rules are identical in structure to _handle_cancel_appointment's
+    (see its own docstring): an explicit `id` must exactly match an ACTIVE
+    appointment's `id` (no fallback to `name`); otherwise `name` is
+    matched case-insensitively against ACTIVE appointments only - zero
+    matches is "not found", exactly one proceeds, more than one triggers a
+    deterministic disambiguation (never a guess) that asks for the id. A
+    legacy no-id record remains updateable alone by unique name; an
+    ambiguous group containing one explains the limitation and changes
+    nothing, exactly like cancellation.
+
+    Only `date`/`time` are ever written to the eventual appointment record
+    - `id`, `name`, `providerId`, `durationMinutes`, `status` are always
+    preserved untouched (see _handle_update_confirm_yes below, the only
+    place anything is actually written).
+
+    Booking, cancellation, and update pending state are mutually
+    exclusive (see PENDING_UPDATE_FILE's own comment): if a pending
+    booking or cancellation already exists, no pending update is ever
+    created here - the caller is told to resolve the existing one first,
+    deterministically, rather than silently overwriting or racing it.
+    """
+    parameters = parameters or {}
+
+    if os.path.exists(PENDING_FILE) or os.path.exists(PENDING_CANCELLATION_FILE):
+        text = (
+            "You already have another appointment action waiting for confirmation. "
+            "Please reply \"yes\" or \"no\" to finish that first, then try updating "
+            "an appointment."
+        )
+        return [response_model.text_message(text)], None
+
+    appointment_id = parameters.get('id')
+    name = parameters.get('name')
     new_date = parameters.get('date')
     new_time = parameters.get('time')
 
-    if os.path.exists(APPOINTMENTS_FILE):
-        appointments = _read_appointments_raw()
+    if not appointment_id and not name:
+        text = "Sure - what's the ID or name on the appointment you'd like to update?"
+        return [response_model.text_message(text)], _UPDATE_STAGE_IDENTIFIER
 
-        updated = False
+    if not os.path.exists(APPOINTMENTS_FILE):
+        return [response_model.text_message("There are no appointments to update yet.")], None
+
+    appointments = _read_appointments_raw()
+
+    if appointment_id:
+        selected = None
         for appointment in appointments:
-            if appointment['name'].lower() == name.lower():
-                if new_date:
-                    appointment['date'] = new_date
-                if new_time:
-                    appointment['time'] = new_time
-                updated = True
+            if appointment.get('id') == appointment_id:
+                selected = appointment
                 break
-
-        if updated:
-            _save_appointments(appointments)
-            text = f"Your appointment for {name} has been updated."
-        else:
-            text = f"I couldn't find an appointment for {name}."
+        if selected is None or not _is_active(selected):
+            text = "I couldn't find an active appointment with that ID. Please check the ID and try again."
+            return [response_model.text_message(text)], _UPDATE_STAGE_IDENTIFIER
     else:
-        text = "There are no appointments to update yet."
+        candidates = [
+            a for a in appointments
+            if _is_active(a) and a.get('name', '').lower() == name.lower()
+        ]
+        if not candidates:
+            text = f"I couldn't find an appointment for {name} to update."
+            return [response_model.text_message(text)], None
 
-    return [response_model.text_message(text)]
+        if len(candidates) > 1:
+            lines = [_describe_candidate(a) for a in candidates]
+            if any(not a.get('id') for a in candidates):
+                text = (
+                    f"I found multiple appointments for {name}, and at least one of them "
+                    "doesn't have a reference ID yet, so I can't safely tell them apart. "
+                    "Here they are - none have been changed:\n" + "\n".join(lines)
+                )
+                return [response_model.text_message(text)], _UPDATE_STAGE_IDENTIFIER
+
+            text = (
+                f"I found multiple appointments for {name}. Please tell me the appointment ID "
+                "of the one you'd like to update:\n" + "\n".join(lines)
+            )
+            suggestions = [
+                {"id": a["id"], "label": f"{a['date']} at {a['time']}", "value": a["id"]}
+                for a in candidates
+            ]
+            return [response_model.text_message(text, suggestions=suggestions)], _UPDATE_STAGE_IDENTIFIER
+
+        selected = candidates[0]
+
+    if not new_date and not new_time:
+        text = (
+            f"Got it - the appointment for {selected['name']} on {selected['date']} at "
+            f"{selected['time']}. What would you like to change - a new date, a new time, "
+            "or both?"
+        )
+        return [response_model.text_message(text)], _UPDATE_STAGE_FIELDS
+
+    check_date = new_date or selected['date']
+    check_time = new_time or selected['time']
+
+    ok, error_text = _check_update_availability(selected, appointments, check_date, check_time)
+    if not ok:
+        return [response_model.text_message(error_text)], _UPDATE_STAGE_FIELDS
+
+    if selected.get('id'):
+        pending = {"id": selected['id']}
+    else:
+        pending = {
+            "name": selected['name'],
+            "originalDate": selected['date'],
+            "originalTime": selected['time'],
+        }
+    if new_date:
+        pending['newDate'] = new_date
+    if new_time:
+        pending['newTime'] = new_time
+
+    with open(PENDING_UPDATE_FILE, 'w') as f:
+        json.dump(pending, f, indent=2)
+
+    change_bits = []
+    if new_date:
+        change_bits.append(f"date to {new_date}")
+    if new_time:
+        change_bits.append(f"time to {new_time}")
+    change_text = " and ".join(change_bits)
+
+    text = (
+        f"Please confirm — update the appointment for {selected['name']} "
+        f"(currently {selected['date']} at {selected['time']}) to change {change_text}? (yes or no)"
+    )
+    return [response_model.text_message(text)], _UPDATE_STAGE_CONFIRM
+
+
+def _handle_update_confirm_yes():
+    """Confirms a pending update. Mirrors _handle_cancel_confirm_yes's own
+    "never trust the initial snapshot, always re-verify fresh" discipline:
+    re-reads appointments.json, re-identifies the exact intended
+    appointment via _matches_pending_update() (never "first matching
+    name"), confirms it is still active, and re-validates the proposed
+    date/time against availability_service one more time (again excluding
+    the appointment itself from its own conflict check) immediately
+    before writing anything. Only `date`/`time` are ever assigned - every
+    other field on the target dict is left exactly as read.
+    """
+    if not os.path.exists(PENDING_UPDATE_FILE):
+        return [response_model.text_message("There is no update pending confirmation.")], None
+
+    with open(PENDING_UPDATE_FILE, 'r') as f:
+        pending = json.load(f)
+
+    if not os.path.exists(APPOINTMENTS_FILE):
+        os.remove(PENDING_UPDATE_FILE)
+        text = "I couldn't find that appointment anymore. No changes were made."
+        return [response_model.text_message(text)], None
+
+    appointments = _read_appointments_raw()
+
+    target = None
+    for appointment in appointments:
+        if _matches_pending_update(appointment, pending):
+            target = appointment
+            break
+
+    if target is None or not _is_active(target):
+        os.remove(PENDING_UPDATE_FILE)
+        text = (
+            "That appointment is no longer available to update - it may have already been "
+            "cancelled or changed. No other appointment was affected."
+        )
+        return [response_model.text_message(text)], None
+
+    new_date = pending.get('newDate')
+    new_time = pending.get('newTime')
+    check_date = new_date or target['date']
+    check_time = new_time or target['time']
+
+    ok, error_text = _check_update_availability(target, appointments, check_date, check_time)
+    if not ok:
+        os.remove(PENDING_UPDATE_FILE)
+        text = (
+            "Sorry, that time is no longer available - it looks like it was just taken. "
+            "No changes were made; please start the update again."
+        )
+        return [response_model.text_message(text)], None
+
+    if new_date:
+        target['date'] = new_date
+    if new_time:
+        target['time'] = new_time
+
+    _save_appointments(appointments)
+    os.remove(PENDING_UPDATE_FILE)
+
+    text = f"Your appointment for {target['name']} has been updated to {target['date']} at {target['time']}."
+    return [response_model.text_message(text)], _UPDATE_STAGE_UPDATED
+
+
+def _handle_update_confirm_no():
+    if os.path.exists(PENDING_UPDATE_FILE):
+        os.remove(PENDING_UPDATE_FILE)
+        text = "No problem! I've left that appointment unchanged."
+    else:
+        text = "There is no update pending confirmation."
+    return [response_model.text_message(text)], None
+
+
+_CANCELLATION_STAGE_IDENTIFIER = "identifier"
+_CANCELLATION_STAGE_CONFIRM = "confirm"
+_CANCELLATION_STAGE_CANCELLED = "cancelled"
+
+
+def _is_active(appointment):
+    """An appointment with no `status` at all (every legacy record) is
+    treated as active, matching availability_service.py's own convention
+    for a missing status. Only an explicit `status == "cancelled"` is
+    treated as inactive - this module doesn't validate `status` against a
+    fixed set the way availability_service.py does, since that stricter
+    validation belongs to slot-conflict reasoning, not to this feature.
+    """
+    return appointment.get('status') != 'cancelled'
+
+
+def _describe_candidate(appointment):
+    """One line of a disambiguation list - includes the id only when the
+    candidate actually has one (never invents one for a legacy record).
+    """
+    parts = []
+    if appointment.get('id'):
+        parts.append(f"ID {appointment['id']}")
+    parts.append(f"{appointment['date']} at {appointment['time']}")
+    if appointment.get('providerId'):
+        parts.append(f"provider {appointment['providerId']}")
+    return "- " + ", ".join(parts)
+
+
+def _matches_pending_cancellation(appointment, pending):
+    """Re-identifies the exact appointment a pending cancellation refers
+    to, without ever falling back to "first matching name" - see
+    _handle_cancel_confirm_yes's docstring for why this matters. Prefers
+    the stable `id` when the pending record has one; for a legacy no-id
+    record, requires an exact match on name AND date AND time together
+    (all three captured verbatim from the original record at selection
+    time, not typed by the user), which is far more specific than name
+    alone.
+    """
+    if 'id' in pending:
+        return appointment.get('id') == pending['id']
+    return (
+        appointment.get('name') == pending.get('name')
+        and appointment.get('date') == pending.get('date')
+        and appointment.get('time') == pending.get('time')
+    )
 
 
 def _handle_cancel_appointment(parameters):
-    name = (parameters or {}).get('name')
-    if not name:
-        return [response_model.text_message(
-            "Sure - what's the name on the appointment you'd like to cancel?"
-        )]
+    """IDENTIFIER -> CONFIRM -> CANCELLED.
 
-    if os.path.exists(APPOINTMENTS_FILE):
-        appointments = _read_appointments_raw()
+    Next Phase 6.1 slice: replaces the previous hard-delete-by-name
+    cancellation with a safe, confirmed, ID-preferring flow. Returns
+    (messages, cancellation_stage) - see response_model.success_response's
+    docstring for the stage vocabulary.
 
-        original_length = len(appointments)
-        appointments = [a for a in appointments if a['name'].lower() != name.lower()]
-        _save_appointments(appointments)
+    Lookup rules, in order:
+      1. `parameters.id`, if given, must exactly match an ACTIVE
+         appointment's `id`. No fallback to `name` if it doesn't - an
+         explicitly supplied id is never silently reinterpreted.
+      2. Otherwise `parameters.name` is matched case-insensitively
+         against ACTIVE appointments only. Zero matches -> "not found".
+         Exactly one match -> proceed. More than one match -> a
+         deterministic disambiguation listing every candidate (id when
+         available, date, time, providerId when available) and asking
+         for the id - never guesses, never picks one. If any candidate in
+         an ambiguous group lacks an id, disambiguation by id isn't
+         possible for that group, so no candidate is selected and nothing
+         is changed - never mutated or backfilled just because it was
+         looked at.
 
-        if len(appointments) < original_length:
-            text = f"Your appointment for {name} has been successfully canceled."
-        else:
-            text = f"I couldn't find an appointment for {name} to cancel."
+    Nothing is written to appointments.json here - only a pending
+    cancellation record (PENDING_CANCELLATION_FILE) once exactly one
+    active appointment has been safely identified.
+    """
+    parameters = parameters or {}
+    appointment_id = parameters.get('id')
+    name = parameters.get('name')
+
+    if not appointment_id and not name:
+        text = "Sure - what's the ID or name on the appointment you'd like to cancel?"
+        return [response_model.text_message(text)], _CANCELLATION_STAGE_IDENTIFIER
+
+    if not os.path.exists(APPOINTMENTS_FILE):
+        return [response_model.text_message("There are no appointments to cancel yet.")], None
+
+    appointments = _read_appointments_raw()
+
+    if appointment_id:
+        selected = None
+        for appointment in appointments:
+            if appointment.get('id') == appointment_id:
+                selected = appointment
+                break
+        if selected is None or not _is_active(selected):
+            text = "I couldn't find an active appointment with that ID. Please check the ID and try again."
+            return [response_model.text_message(text)], _CANCELLATION_STAGE_IDENTIFIER
+        pending = {"id": appointment_id}
     else:
-        text = "There are no appointments to cancel yet."
+        candidates = [
+            a for a in appointments
+            if _is_active(a) and a.get('name', '').lower() == name.lower()
+        ]
+        if not candidates:
+            text = f"I couldn't find an appointment for {name} to cancel."
+            return [response_model.text_message(text)], None
 
-    return [response_model.text_message(text)]
+        if len(candidates) > 1:
+            lines = [_describe_candidate(a) for a in candidates]
+            if any(not a.get('id') for a in candidates):
+                text = (
+                    f"I found multiple appointments for {name}, and at least one of them "
+                    "doesn't have a reference ID yet, so I can't safely tell them apart. "
+                    "Here they are - none have been changed:\n" + "\n".join(lines)
+                )
+                return [response_model.text_message(text)], _CANCELLATION_STAGE_IDENTIFIER
+
+            text = (
+                f"I found multiple appointments for {name}. Please tell me the appointment ID "
+                "of the one you'd like to cancel:\n" + "\n".join(lines)
+            )
+            suggestions = [
+                {"id": a["id"], "label": f"{a['date']} at {a['time']}", "value": a["id"]}
+                for a in candidates
+            ]
+            return [response_model.text_message(text, suggestions=suggestions)], _CANCELLATION_STAGE_IDENTIFIER
+
+        selected = candidates[0]
+        if selected.get('id'):
+            pending = {"id": selected['id']}
+        else:
+            pending = {"name": selected['name'], "date": selected['date'], "time": selected['time']}
+
+    with open(PENDING_CANCELLATION_FILE, 'w') as f:
+        json.dump(pending, f, indent=2)
+
+    provider_bit = f" with {selected['providerId']}" if selected.get('providerId') else ""
+    text = (
+        f"Please confirm — cancel the appointment for {selected['name']} on {selected['date']} "
+        f"at {selected['time']}{provider_bit}? (yes or no)"
+    )
+    return [response_model.text_message(text)], _CANCELLATION_STAGE_CONFIRM
+
+
+def _handle_cancel_confirm_yes():
+    """Confirms a pending cancellation. Mirrors _handle_yes_intent's own
+    "never trust the initial snapshot, always re-verify fresh" discipline:
+    re-reads appointments.json and re-identifies the exact intended
+    appointment via _matches_pending_cancellation() - never by re-running
+    a "first matching name" search - so a record that changed or vanished
+    between the initial request and this confirmation is handled safely
+    instead of silently affecting a different appointment.
+    """
+    if not os.path.exists(PENDING_CANCELLATION_FILE):
+        return [response_model.text_message("There is no cancellation pending confirmation.")], None
+
+    with open(PENDING_CANCELLATION_FILE, 'r') as f:
+        pending = json.load(f)
+
+    if not os.path.exists(APPOINTMENTS_FILE):
+        os.remove(PENDING_CANCELLATION_FILE)
+        text = "I couldn't find that appointment anymore. No changes were made."
+        return [response_model.text_message(text)], None
+
+    appointments = _read_appointments_raw()
+
+    target = None
+    for appointment in appointments:
+        if _matches_pending_cancellation(appointment, pending):
+            target = appointment
+            break
+
+    if target is None or not _is_active(target):
+        os.remove(PENDING_CANCELLATION_FILE)
+        text = (
+            "That appointment is no longer available to cancel - it may have already been "
+            "cancelled or changed. No other appointment was affected."
+        )
+        return [response_model.text_message(text)], None
+
+    target['status'] = 'cancelled'
+    _save_appointments(appointments)
+    os.remove(PENDING_CANCELLATION_FILE)
+
+    text = f"Your appointment for {target['name']} on {target['date']} at {target['time']} has been cancelled."
+    return [response_model.text_message(text)], _CANCELLATION_STAGE_CANCELLED
+
+
+def _handle_cancel_confirm_no():
+    if os.path.exists(PENDING_CANCELLATION_FILE):
+        os.remove(PENDING_CANCELLATION_FILE)
+        text = "No problem! I've left that appointment unchanged."
+    else:
+        text = "There is no cancellation pending confirmation."
+    return [response_model.text_message(text)], None
 
 
 def _handle_view_appointments():
+    """Next Phase 6.1 slice: excludes cancelled appointments from the
+    normal active listing (a missing `status` still counts as active, for
+    legacy records) and shows each active appointment's `id` when it has
+    one - legacy no-id records still display exactly as before, just
+    without an ID suffix.
+    """
     if os.path.exists(APPOINTMENTS_FILE):
         try:
             appointments = _read_appointments_raw()
-            if appointments:
-                response_lines = [f"{a['name']} on {a['date']} at {a['time']}" for a in appointments]
+            active = [a for a in appointments if _is_active(a)]
+            if active:
+                response_lines = []
+                for a in active:
+                    line = f"{a['name']} on {a['date']} at {a['time']}"
+                    if a.get('id'):
+                        line += f" (ID: {a['id']})"
+                    response_lines.append(line)
                 text = "Here’s a quick look at your scheduled appointments:\n" + "\n".join(response_lines)
             else:
                 text = "You don't have any appointments booked at the moment."

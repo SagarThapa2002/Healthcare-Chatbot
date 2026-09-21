@@ -217,6 +217,8 @@ class BookingFlowTestCase(unittest.TestCase):
 
         self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
+        self.pending_cancellation_file = os.path.join(self.tmp_dir.name, 'pending_cancellation.json')
+        self.pending_update_file = os.path.join(self.tmp_dir.name, 'pending_update.json')
 
         # chatbot_logic.py and availability_service.py each independently
         # compute their own APPOINTMENTS_FILE constant (both point at the
@@ -225,16 +227,32 @@ class BookingFlowTestCase(unittest.TestCase):
         # explicit `appointments` override, inside _check_date_availability
         # / _resolve_slot_choice) would silently read the real, unmocked
         # backend/appointments.json instead of this test's isolated data.
+        # PENDING_CANCELLATION_FILE/PENDING_UPDATE_FILE must also be
+        # patched - handle_webhook_request checks their existence on every
+        # YesIntent/NoIntent to decide whether to route to the
+        # cancellation/update confirm handlers, so leaving either
+        # unpatched would have that check silently hit the real repo path
+        # instead of this isolated one.
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_pending_cancellation = patch.object(
+            chatbot_logic, 'PENDING_CANCELLATION_FILE', self.pending_cancellation_file
+        )
+        patcher_pending_update = patch.object(
+            chatbot_logic, 'PENDING_UPDATE_FILE', self.pending_update_file
+        )
         patcher_availability_appointments = patch.object(
             availability_service, 'APPOINTMENTS_FILE', self.appointments_file
         )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_pending_cancellation.start()
+        patcher_pending_update.start()
         patcher_availability_appointments.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_pending_cancellation.stop)
+        self.addCleanup(patcher_pending_update.stop)
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
@@ -855,9 +873,245 @@ class AppointmentIdTest(BookingFlowTestCase):
         with open(self.appointments_file, 'w') as f:
             json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
 
-        response = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"})
-        text = response.get_json()["messages"][0]["content"]["text"]
-        self.assertIn("successfully canceled", text)
+        identify = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"})
+        self.assertIn("yes or no", identify.get_json()["messages"][0]["content"]["text"])
+
+        confirmed = self.post_webhook("YesIntent")
+        text = confirmed.get_json()["messages"][0]["content"]["text"]
+        self.assertIn("has been cancelled", text)
+
+
+class CancellationFlowTest(BookingFlowTestCase):
+    """Next Phase 6.1 slice: safe, confirmed, ID-preferring cancellation -
+    replaces the previous hard-delete-by-name flow with status="cancelled"
+    plus explicit confirmation. Every test seeds data via the isolated tmp
+    files from BookingFlowTestCase.setUp - never the real
+    backend/appointments.json - and PENDING_CANCELLATION_FILE is patched
+    to an isolated tmp path there too.
+    """
+
+    def _book_and_confirm(self, name="Test Patient", date="2026-12-28", time="10:00"):
+        self.post_webhook(
+            "Book Appointment", {"name": name, "providerId": "dr-patel", "date": date, "time": time}
+        )
+        booked = self.post_webhook("YesIntent").get_json()
+        return booked["messages"][0]["content"]["appointment"]
+
+    def _read_appointments(self):
+        with open(self.appointments_file, 'r') as f:
+            return json.load(f)
+
+    def test_cancel_by_valid_id_full_round_trip(self):
+        appointment = self._book_and_confirm()
+
+        identify = self.post_webhook("Cancel Appointment", {"id": appointment["id"]}).get_json()
+        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+        self.assertEqual(identify["context"]["cancellationStage"], "confirm")
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
+        self.assertEqual(confirmed["context"]["cancellationStage"], "cancelled")
+
+        saved = self._read_appointments()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["status"], "cancelled")
+        self.assertEqual(saved[0]["id"], appointment["id"])
+        self.assertEqual(saved[0]["name"], "Test Patient")
+        self.assertEqual(saved[0]["providerId"], "dr-patel")
+        self.assertEqual(saved[0]["date"], "2026-12-28")
+        self.assertEqual(saved[0]["time"], "10:00")
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+    def test_cancellation_requires_confirmation_before_any_change(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+
+        saved = self._read_appointments()
+        self.assertNotIn("status", saved[0])
+
+    def test_no_leaves_appointment_unchanged_and_clears_pending(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+
+        response = self.post_webhook("NoIntent").get_json()
+        self.assertIn("unchanged", response["messages"][0]["content"]["text"].lower())
+
+        saved = self._read_appointments()
+        self.assertNotIn("status", saved[0])
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+    def test_invalid_id_does_not_fall_back_to_another_appointment(self):
+        self._book_and_confirm(name="Test Patient", date="2026-12-28", time="10:00")
+
+        response = self.post_webhook(
+            "Cancel Appointment", {"id": "does-not-exist", "name": "Test Patient"}
+        ).get_json()
+        self.assertIn(
+            "couldn't find an active appointment", response["messages"][0]["content"]["text"].lower()
+        )
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+        saved = self._read_appointments()
+        self.assertNotIn("status", saved[0])
+
+    def test_cancel_by_unique_name_remains_backward_compatible(self):
+        appointment = self._book_and_confirm(name="Only Match")
+
+        identify = self.post_webhook("Cancel Appointment", {"name": "Only Match"}).get_json()
+        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
+
+        saved = self._read_appointments()
+        self.assertEqual(saved[0]["status"], "cancelled")
+        self.assertEqual(saved[0]["id"], appointment["id"])
+
+    def test_legacy_no_id_appointment_cancellable_by_unique_name_and_not_backfilled(self):
+        with open(self.appointments_file, 'w') as f:
+            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+
+        identify = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"}).get_json()
+        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
+
+        saved = self._read_appointments()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["status"], "cancelled")
+        self.assertNotIn("id", saved[0])
+
+    def test_duplicate_name_produces_disambiguation_and_cancels_neither(self):
+        first = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:00")
+        second = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:30")
+
+        response = self.post_webhook("Cancel Appointment", {"name": "Dup Patient"}).get_json()
+        text = response["messages"][0]["content"]["text"]
+        self.assertIn(first["id"], text)
+        self.assertIn(second["id"], text)
+        self.assertEqual(response["context"]["cancellationStage"], "identifier")
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+        saved = self._read_appointments()
+        for a in saved:
+            self.assertNotIn("status", a)
+
+    def test_duplicate_name_disambiguation_includes_suggestions_with_ids(self):
+        first = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:00")
+        second = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:30")
+
+        response = self.post_webhook("Cancel Appointment", {"name": "Dup Patient"}).get_json()
+        suggestion_values = [s["value"] for s in response["messages"][0]["suggestions"]]
+        self.assertIn(first["id"], suggestion_values)
+        self.assertIn(second["id"], suggestion_values)
+
+    def test_duplicate_name_with_one_legacy_record_does_not_offer_id_disambiguation(self):
+        self._book_and_confirm(name="Mixed Patient", date="2026-12-28", time="10:00")
+        saved = self._read_appointments()
+        saved.append({"name": "Mixed Patient", "date": "2026-01-01", "time": "09:00"})
+        with open(self.appointments_file, 'w') as f:
+            json.dump(saved, f)
+
+        response = self.post_webhook("Cancel Appointment", {"name": "Mixed Patient"}).get_json()
+        text = response["messages"][0]["content"]["text"]
+        self.assertIn("can't safely tell them apart", text)
+        self.assertEqual(response["messages"][0]["suggestions"], [])
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+        saved_after = self._read_appointments()
+        for a in saved_after:
+            self.assertNotIn("status", a)
+
+    def test_cancelled_appointments_excluded_from_active_view(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+        self.post_webhook("YesIntent")
+
+        response = self.post_webhook("View Appointments").get_json()
+        text = response["messages"][0]["content"]["text"]
+        self.assertIn("don't have any appointments", text.lower())
+
+    def test_legacy_no_status_appointment_remains_visible(self):
+        with open(self.appointments_file, 'w') as f:
+            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+
+        response = self.post_webhook("View Appointments").get_json()
+        text = response["messages"][0]["content"]["text"]
+        self.assertIn("Legacy Patient", text)
+
+    def test_active_appointment_displays_its_id(self):
+        appointment = self._book_and_confirm()
+
+        response = self.post_webhook("View Appointments").get_json()
+        text = response["messages"][0]["content"]["text"]
+        self.assertIn(appointment["id"], text)
+
+    def test_already_cancelled_before_confirmation_does_not_affect_another_appointment(self):
+        first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
+        second = self._book_and_confirm(name="Second Patient", date="2026-12-28", time="10:30")
+
+        self.post_webhook("Cancel Appointment", {"id": first["id"]})
+
+        # `first` is cancelled through some other path before the
+        # confirmation reply arrives - the final "yes" must re-read fresh
+        # data and detect this, rather than trusting the initial snapshot.
+        saved = self._read_appointments()
+        for a in saved:
+            if a["id"] == first["id"]:
+                a["status"] = "cancelled"
+        with open(self.appointments_file, 'w') as f:
+            json.dump(saved, f)
+
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertIn("no longer available to cancel", confirmed["messages"][0]["content"]["text"])
+
+        saved_after = self._read_appointments()
+        second_after = next(a for a in saved_after if a["id"] == second["id"])
+        self.assertNotIn("status", second_after)
+
+    def test_pending_cancellation_cleared_after_success(self):
+        appointment = self._book_and_confirm()
+        self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+
+        self.post_webhook("YesIntent")
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+
+    def test_pending_cancellation_does_not_interfere_with_booking_pending_state(self):
+        first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
+        self.post_webhook("Cancel Appointment", {"id": first["id"]})
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+        self.assertFalse(os.path.exists(self.pending_file))
+
+        # A brand-new booking flow started while the cancellation is
+        # pending must be completely unaffected.
+        self.post_webhook("Book Appointment", {"name": "Second Patient", "providerId": "dr-patel"})
+        confirm_booking = self.post_webhook(
+            "Book Appointment",
+            {"name": "Second Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "11:00"},
+        ).get_json()
+        self.assertIn("yes or no", confirm_booking["messages"][0]["content"]["text"])
+        self.assertTrue(os.path.exists(self.pending_file))
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+
+        # Phase 6.1 Slice B: pending booking/cancellation/update state is
+        # now treated as mutually exclusive, with no arbitrary priority
+        # between them (see handle_webhook_request's own comment) - if
+        # more than one somehow exists at once anyway, a bare "yes" fails
+        # closed instead of guessing which one the user meant. Neither
+        # pending file is touched, and neither appointment is modified.
+        confirmed = self.post_webhook("YesIntent").get_json()
+        self.assertNotIn("cancellationStage", confirmed["context"])
+        self.assertNotIn("bookingStage", confirmed["context"])
+        self.assertIn("more than one action", confirmed["messages"][0]["content"]["text"].lower())
+        self.assertTrue(os.path.exists(self.pending_file))
+        self.assertTrue(os.path.exists(self.pending_cancellation_file))
+
+        saved = self._read_appointments()
+        first_after = next(a for a in saved if a["id"] == first["id"])
+        self.assertNotEqual(first_after.get("status"), "cancelled")
 
 
 if __name__ == '__main__':

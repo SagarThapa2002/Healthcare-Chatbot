@@ -542,3 +542,210 @@ describe('cancellation flow (Phase 6.1 Slice A - frontend, context.cancellationS
     expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
   });
 });
+
+// Builds a fake Update Appointment (or its yes/no confirmation) envelope
+// with a given `updateStage`, matching backend/response_model.py's
+// success_response(..., update_stage=...) contract exactly -
+// `updateStage` is omitted from `context` when not given, the same way
+// the real contract omits it.
+function envelopeWithUpdate(text, updateStage) {
+  return {
+    success: true,
+    error: null,
+    messages: [{ type: 'text', content: { text }, suggestions: [] }],
+    context: { intent: 'Update Appointment', ...(updateStage ? { updateStage } : {}) },
+    meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+  };
+}
+
+describe('update flow (Phase 6.1 Slice B - frontend, context.updateStage only)', () => {
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  test('starting update stores "identifier" - the next reply is routed as an update identifier, not a fresh intent', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithUpdate("Sure - what's the ID or name on the appointment you'd like to update?", 'identifier')
+    );
+    await submitMessage(result, 'update my appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', {});
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithUpdate('Got it - what would you like to change?', 'fields')
+    );
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar' });
+  });
+
+  test('a UUID-shaped identifier reply is sent as `id`, not `name`', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+
+    const uuid = 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d';
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'fields'));
+    await submitMessage(result, uuid);
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { id: uuid });
+  });
+
+  test('fields stage: a recognized date is sent as `date`, alongside the captured identifier', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
+    await submitMessage(result, 'Sagar');
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar', date: '2026-12-30' });
+  });
+
+  test('fields stage: a recognized time is sent as `time`, alongside the captured identifier', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
+    await submitMessage(result, 'Sagar');
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '14:00');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar', time: '14:00' });
+  });
+
+  test('fields stage: a reply containing both a date and a time sends both', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
+    await submitMessage(result, 'Sagar');
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30 at 14:00');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Update Appointment', { name: 'Sagar', date: '2026-12-30', time: '14:00' }
+    );
+  });
+
+  test('fields stage: neither a date nor a time recognized - no backend call, state remains "fields"', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
+    await submitMessage(result, 'Sagar');
+
+    callBackend.mockClear();
+    await submitMessage(result, 'not a date or a time');
+    expect(callBackend).not.toHaveBeenCalled();
+
+    // State must still be "fields" - the next, valid reply is still
+    // treated as answering it, not routed as a fresh intent.
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar', date: '2026-12-30' });
+  });
+
+  test('confirm "yes" reaches YesIntent (no separate confirmation API)', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'fields'));
+    await submitMessage(result, 'Sagar');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Your appointment has been updated.', 'updated'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
+
+  test('confirm "no" reaches NoIntent and resets local state per the backend response', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'fields'));
+    await submitMessage(result, 'Sagar');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+
+    // _handle_update_confirm_no returns update_stage=None.
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("No problem! I've left that appointment unchanged.", undefined));
+    await submitMessage(result, 'no');
+    expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {});
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('"updated" resets local state - the next message is ordinary single-shot routing', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'fields'));
+    await submitMessage(result, 'Sagar');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Your appointment has been updated.', 'updated'));
+    await submitMessage(result, 'yes');
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('a missing updateStage does not cause an inferred state transition (fail closed)', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    // No updateStage at all in the response context - e.g. the "not
+    // found" path in _handle_update_appointment, which returns None.
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("I couldn't find an appointment for Someone to update.", undefined));
+    await submitMessage(result, 'update my appointment');
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'hello there');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'hello there' });
+  });
+
+  test('an in-progress update does not affect a subsequent, independent booking flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("I couldn't find an appointment for Ghost to update.", undefined));
+    await submitMessage(result, 'Ghost');
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await submitMessage(result, 'book an appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', {});
+  });
+
+  test('an in-progress update does not affect an independent cancellation flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('...', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("I couldn't find an appointment for Ghost to update.", undefined));
+    await submitMessage(result, 'Ghost');
+
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('...', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', {});
+  });
+
+  test('regression: Update Appointment interrupting an active booking still stores updateStage - the next reply stays in the update flow', async () => {
+    const { result } = renderHook(() => useConversation());
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await submitMessage(result, 'book an appointment');
+
+    callBackend.mockResolvedValueOnce(
+      envelopeWithUpdate("Sure - what's the ID or name on the appointment you'd like to update?", 'identifier')
+    );
+    await submitMessage(result, 'update my appointment');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', {});
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar' });
+  });
+});

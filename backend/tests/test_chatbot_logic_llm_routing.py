@@ -29,13 +29,31 @@ class LLMRoutingTestCase(unittest.TestCase):
 
         self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
+        self.pending_cancellation_file = os.path.join(self.tmp_dir.name, 'pending_cancellation.json')
+        self.pending_update_file = os.path.join(self.tmp_dir.name, 'pending_update.json')
 
+        # Phase 6.1 Slice B: _handle_update_appointment itself (not just
+        # handle_webhook_request's YesIntent/NoIntent dispatch) now checks
+        # PENDING_CANCELLATION_FILE/PENDING_UPDATE_FILE directly (see its
+        # own mutual-exclusion guard), so both must be patched here too or
+        # this class's Update Appointment test would silently consult the
+        # real repo paths instead of this isolated tmp directory.
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
+        patcher_pending_cancellation = patch.object(
+            chatbot_logic, 'PENDING_CANCELLATION_FILE', self.pending_cancellation_file
+        )
+        patcher_pending_update = patch.object(
+            chatbot_logic, 'PENDING_UPDATE_FILE', self.pending_update_file
+        )
         patcher_appointments.start()
         patcher_pending.start()
+        patcher_pending_cancellation.start()
+        patcher_pending_update.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
+        self.addCleanup(patcher_pending_cancellation.stop)
+        self.addCleanup(patcher_pending_update.stop)
 
         self.client = app.test_client()
 

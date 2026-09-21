@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { detectIntent, INTERRUPTION_INTENTS } from '../conversation/intent';
-import { parseDate } from '../conversation/dateTime';
+import { parseDate, parseTime } from '../conversation/dateTime';
 import { isValidName } from '../conversation/validation';
 import {
   EMPTY_BOOKING,
@@ -35,6 +35,25 @@ function prefixFirstMessage(envelope, prefix) {
 // data, so it does not reproduce the backend's own lookup logic.
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Derives the next local update state from an Update Appointment (or its
+// yes/no confirmation) response - `stage` reads only context.updateStage,
+// never suggestions/prose/message count (same structural-authority
+// pattern as cancellationStage). Unlike cancellation, the backend has no
+// persisted memory of *which* appointment is being updated until the
+// pending-update file is written at the "confirm" stage (see
+// backend/chatbot_logic.py's _handle_update_appointment) - so while the
+// stage is "fields", every reply must still resend the original id/name
+// alongside the new date/time, or the backend has nothing to match
+// against. `identifier` is only kept across "fields"/"confirm" (where it
+// may still be needed to re-send, or is simply harmless to keep); it's
+// cleared on any other stage (including a fresh "identifier" prompt,
+// where the next reply will supply and capture a new one).
+function deriveUpdateState(envelope, identifier) {
+  const stage = envelope.context?.updateStage ?? null;
+  const keepIdentifier = stage === 'fields' || stage === 'confirm';
+  return { stage, identifier: keepIdentifier ? identifier : null };
+}
+
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
@@ -50,6 +69,11 @@ function useConversation() {
   // sole structural authority for this flow, the same role bookingStage
   // plays for booking).
   const [cancellationStage, setCancellationStage] = useState(null);
+  // The update flow's local state: which stage the backend last reported
+  // it's waiting on, plus (while relevant) the id/name captured at the
+  // "identifier" stage - see deriveUpdateState's own comment for why this
+  // one flow needs slightly more than a bare stage value.
+  const [update, setUpdate] = useState({ stage: null, identifier: null });
 
   // For plain client-side prompts (validation messages, etc.) that never
   // went through the backend, so they render with the same shape as a
@@ -104,16 +128,22 @@ function useConversation() {
           setBooking(EMPTY_BOOKING);
           const parameters = otherIntent === 'Symptom Check' ? { symptom: text } : {};
           const envelope = await callBackend(otherIntent, parameters);
-          // An interruption into Cancel Appointment starts the cancellation
-          // flow exactly like the plain (non-interrupting) entry point
-          // below does - read only from context.cancellationStage, never
-          // from suggestions/prose/message count. Every other interrupting
-          // intent (Symptom Check, View Appointments, Update Appointment)
-          // is unaffected - none of them ever set this.
+          // An interruption into Cancel Appointment or Update Appointment
+          // starts that flow exactly like its own plain (non-interrupting)
+          // entry point below does - read only from
+          // context.cancellationStage/updateStage, never from
+          // suggestions/prose/message count. Symptom Check and View
+          // Appointments are unaffected - neither ever sets either of
+          // these.
           if (otherIntent === 'Cancel Appointment') {
             const nextStage = envelope.context?.cancellationStage;
             if (nextStage === 'identifier' || nextStage === 'confirm' || nextStage === 'cancelled') {
               setCancellationStage(nextStage);
+            }
+          } else if (otherIntent === 'Update Appointment') {
+            const nextStage = envelope.context?.updateStage;
+            if (['identifier', 'fields', 'confirm', 'updated'].includes(nextStage)) {
+              setUpdate({ stage: nextStage, identifier: null });
             }
           }
           sayEnvelope(prefixFirstMessage(envelope, '(Cancelled your in-progress booking.) '));
@@ -259,7 +289,74 @@ function useConversation() {
         return;
       }
 
-      // No booking or cancellation in progress - ordinary single-shot routing.
+      // Update's local state machine: same "reached only when no booking
+      // is in progress" placement as cancellation above, and independent
+      // of it (booking/cancellation/update are mutually exclusive on the
+      // backend - see chatbot_logic.py's PENDING_UPDATE_FILE comment - so
+      // in practice at most one of cancellationStage/update.stage is ever
+      // non-null at a time).
+      if (update.stage === 'confirm') {
+        const answer = text.trim().toLowerCase();
+
+        if (answer === 'yes') {
+          const envelope = await callBackend('YesIntent', {});
+          setUpdate(deriveUpdateState(envelope, update.identifier));
+          sayEnvelope(envelope);
+          return;
+        }
+        if (answer === 'no') {
+          const envelope = await callBackend('NoIntent', {});
+          setUpdate(deriveUpdateState(envelope, update.identifier));
+          sayEnvelope(envelope);
+          return;
+        }
+
+        sayText('Please reply "yes" to confirm the update, or "no" to keep the appointment as is.');
+        return;
+      }
+
+      if (update.stage === 'fields') {
+        // Lightweight routing only, using the SAME date/time parsers
+        // booking already uses - never a new parser, never a lookup
+        // against appointment data. Backend validation (format, and
+        // provider availability) remains authoritative either way; this
+        // only decides whether there's anything worth sending yet.
+        const date = parseDate(text);
+        const time = parseTime(text);
+
+        if (!date && !time) {
+          sayText(
+            "I didn't catch a new date or time - could you give me a date (e.g. 2026-12-26) "
+            + "and/or a time (e.g. 14:00)?"
+          );
+          return;
+        }
+
+        const parameters = { ...update.identifier };
+        if (date) parameters.date = date;
+        if (time) parameters.time = time;
+        const envelope = await callBackend('Update Appointment', parameters);
+        setUpdate(deriveUpdateState(envelope, update.identifier));
+        sayEnvelope(envelope);
+        return;
+      }
+
+      if (update.stage === 'identifier') {
+        if (!text.trim()) {
+          sayText("Please tell me the ID or name of the appointment you'd like to update.");
+          return;
+        }
+
+        const trimmed = text.trim();
+        const identifierParams = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
+        const envelope = await callBackend('Update Appointment', identifierParams);
+        setUpdate(deriveUpdateState(envelope, identifierParams));
+        sayEnvelope(envelope);
+        return;
+      }
+
+      // No booking, cancellation, or update in progress - ordinary
+      // single-shot routing.
       const intent = detectIntent(text);
       if (intent === 'Book Appointment') {
         const fields = extractInitialBookingFields(text);
@@ -290,6 +387,8 @@ function useConversation() {
         const envelope = await callBackend(intent, parameters);
         if (intent === 'Cancel Appointment') {
           setCancellationStage(envelope.context?.cancellationStage ?? null);
+        } else if (intent === 'Update Appointment') {
+          setUpdate(deriveUpdateState(envelope, null));
         }
         sayEnvelope(envelope);
       }

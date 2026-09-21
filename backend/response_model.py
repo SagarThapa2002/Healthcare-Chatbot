@@ -112,11 +112,13 @@ def assistant_response_message(text, *, provider="claude", suggestions=None):
     }
 
 
-def success_response(messages, intent, request_id=None, booking_stage=None, cancellation_stage=None):
-    """`booking_stage`/`cancellation_stage`, if given, are folded into
-    `context` alongside `intent` - both optional and additive, so every
-    existing caller that doesn't pass them gets the exact same `context`
-    shape as before.
+def success_response(
+    messages, intent, request_id=None, booking_stage=None, cancellation_stage=None, update_stage=None,
+):
+    """`booking_stage`/`cancellation_stage`/`update_stage`, if given, are
+    folded into `context` alongside `intent` - all optional and additive,
+    so every existing caller that doesn't pass them gets the exact same
+    `context` shape as before.
 
     Phase 6.1, Slice 3, Step 4 (revised): `booking_stage` lets a caller
     (chatbot_logic.py's Book Appointment / YesIntent handling) structurally
@@ -127,17 +129,23 @@ def success_response(messages, intent, request_id=None, booking_stage=None, canc
     from response text or `success` (which only means the request was
     processed, not that any particular field was valid).
 
-    Next Phase 6.1 slice: `cancellation_stage` is the same idea for the
-    cancel-by-ID flow, folded into `context` as `cancellationStage` - one
-    of "identifier", "confirm", "cancelled". Deliberately a separate field
-    from `bookingStage`, never reused between the two flows, so a client
-    can always tell which (if either) flow a response belongs to.
+    `cancellation_stage` is the same idea for the cancel-by-ID flow,
+    folded into `context` as `cancellationStage` - one of "identifier",
+    "confirm", "cancelled".
+
+    Phase 6.1 Slice B: `update_stage` is the same idea again for the
+    update-by-ID flow, folded into `context` as `updateStage` - one of
+    "identifier", "fields", "confirm", "updated". All three stage fields
+    are deliberately separate, never reused between flows, so a client
+    can always tell which (if any) flow a response belongs to.
     """
     context = {"intent": intent}
     if booking_stage is not None:
         context["bookingStage"] = booking_stage
     if cancellation_stage is not None:
         context["cancellationStage"] = cancellation_stage
+    if update_stage is not None:
+        context["updateStage"] = update_stage
     return {
         "success": True,
         "error": None,
