@@ -322,3 +322,89 @@ saves before considering the next one - so a reminder is removed from every
 future "due" result the instant it's processed. Calling
 `process_due_reminders()` again immediately (or at any later time) only ever
 sees reminders that genuinely haven't been processed yet.
+
+### Sender exceptions are isolated per reminder (Phase 6.2-C)
+
+`send(reminder, appointment)` is only required to return a plain `bool`, but
+a future real provider can instead *raise* (a network timeout, a malformed
+API response, etc.) - an ordinary, expected external I/O failure, not a
+data-integrity problem. `process_due_reminders()` catches an exception from
+`send` for exactly the one reminder being processed, maps it to the same
+outcome a `False` return would produce (`failed`,
+`failureReason = REMINDER_FAILURE_SEND_FAILED`), and continues with the
+remaining due reminders in the same call - a flaky provider call must never
+abort an entire batch of otherwise-unrelated reminders. Only the exception's
+type is logged (never its text or any reminder/appointment content),
+matching `backend/LOGGING_NOTES.md`'s existing metadata-only policy. This is
+deliberately different from a malformed reminder *record*, which still
+aborts the whole run via `get_due_reminders`/`_validate_reminder` (see
+"Malformed data" above) - a corrupt record in this module's own store is
+worth stopping for; a flaky external call is not.
+
+## Phase 6.2-C architecture decisions (delivery, not yet built)
+
+No provider, scheduler, or new dependency is added in this phase. These are
+the approved decisions for when one is:
+
+- **The delivery seam stays a plain callable.** `send(reminder, appointment)
+  -> bool` remains the entire contract - no `NotificationSender`
+  Protocol/ABC, no provider base class. This codebase has no type-hint
+  infrastructure anywhere (no `typing` usage, no mypy/pyright config), and a
+  formal interface would be new ceremony with nothing to enforce it. It also
+  directly duplicates a problem this project has already solved once: the
+  LLM provider boundary (`claude_provider.generate_reply`/
+  `mock_provider.generate_reply`, both plain functions matching one
+  signature, selected by an env-var string) is the proven template for
+  whatever a real notification provider eventually looks like.
+- **No `channel` field on the reminder record yet.** Adding it now, with no
+  second real channel to distinguish, would repeat this schema's own
+  `durationMinutes` problem - a field nobody populates. The decision belongs
+  to whichever future phase first introduces a genuinely distinguishable
+  second channel, since at that point it becomes a real idempotency-key
+  question (`appointmentId, type, channel`), not before.
+- **No contact/destination field anywhere in production code or
+  `appointments.json`.** There is no patient-contact or profile concept
+  anywhere in this project today (appointments are identified by a free-text
+  `name`, not a patient entity) - adding one is a separate, later feature,
+  not part of notification delivery architecture.
+- **Synthetic destinations exist only in tests**, constructed ad hoc as
+  throwaway fixture data (e.g. an `@example.invalid` address, reserved by
+  RFC 2606 for exactly this purpose) - never persisted, never touching real
+  data or the real legacy appointment records.
+- **No LLM-generated notification content, ever.** A future message-
+  composition step must remain a fixed, deterministic template, never routed
+  through `assistant_service.py`/Claude - this is a hard boundary for
+  healthcare-adjacent notification text, not a style preference. The
+  template itself is not designed or built in this phase; when it is, the
+  safest default is date/time only - provider *specialty* should likely
+  never be included, since it is the field most likely to leak a sensitive
+  inference in a real deployment (this project's synthetic specialties are
+  innocuous, but the principle isn't specific to synthetic data).
+- **The scheduler/trigger mechanism remains fully deferred.** Whatever
+  eventually calls `process_due_reminders()` periodically (cron, an
+  external job runner, etc.) should do nothing but that - all eligibility,
+  due-detection, and state-transition logic stays inside
+  `reminder_service.py`. An in-process background worker (e.g. APScheduler)
+  is specifically flagged as risky in this project's *current* setup:
+  `app.py` runs via `app.run(debug=True)`, whose reloader can spawn the
+  process twice, which would recreate the concurrent-invocation problem
+  below by accident.
+- **Concurrent-invocation protection is deferred, and is an external
+  invariant, not something `reminder_service.py` enforces.** Two overlapping
+  `process_due_reminders()` calls could both read the same `pending`
+  reminder as due before either writes, both call `send()` (a real
+  duplicate message once a real provider exists), and race on the
+  unlocked JSON write. This cannot be solved within the current JSON
+  architecture without file locking or a real transactional datastore with
+  atomic claim semantics (`UPDATE ... WHERE status='pending'`) - neither is
+  added here. "Exactly one invocation at a time" must be guaranteed by
+  whatever triggers this function (e.g. a single-instance scheduler
+  guarantee), not by this module.
+- **Future provider-level idempotency keys.** The crash-after-successful-
+  send-before-persisted-as-sent risk (see "At-least-once" reasoning above)
+  becomes materially real once delivery is real, not theoretical. When a
+  real provider is built, its `send()` implementation should use the
+  reminder's own stable `id` as a provider-side idempotency key wherever the
+  chosen provider supports one (many email/SMS APIs do), so a crash-and-
+  retry doesn't risk a genuine duplicate message to the patient even though
+  the reminder *record* itself is at-least-once, not exactly-once.

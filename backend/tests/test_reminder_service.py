@@ -519,6 +519,51 @@ class ProcessDueRemindersTest(ReminderServiceTestCase):
         self.assertEqual(reasons["r-fail"], reminder_service.REMINDER_FAILURE_SEND_FAILED)
         self.assertEqual(reasons["r-missing"], reminder_service.REMINDER_FAILURE_APPOINTMENT_NOT_FOUND)
 
+    def test_sender_exception_is_isolated_to_that_reminder_and_batch_continues(self):
+        # Phase 6.2-C: a future real provider can raise (a network
+        # timeout, a malformed response, etc.) rather than cleanly
+        # returning False. This must be caught and treated as an ordinary
+        # delivery failure for exactly that one reminder - not abort the
+        # whole batch - and no exception should ever escape
+        # process_due_reminders() itself.
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([
+            make_reminder(id="r-raises", appointmentId="a-raises", sendAt=now.isoformat()),
+            make_reminder(id="r-ok", appointmentId="a-ok", sendAt=now.isoformat()),
+        ])
+        self._write_appointments([
+            self._active_appointment("a-raises"),
+            self._active_appointment("a-ok"),
+        ])
+
+        def send(reminder, appointment):
+            if reminder["id"] == "r-raises":
+                raise RuntimeError("simulated provider failure - network timeout")
+            return True
+
+        # No exception escapes the call itself.
+        processed = reminder_service.process_due_reminders(
+            send, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+
+        outcomes = {r["id"]: r for r in processed}
+
+        # 1. Sender exception -> failed/send_failed.
+        self.assertEqual(outcomes["r-raises"]["status"], "failed")
+        self.assertEqual(outcomes["r-raises"]["failureReason"], reminder_service.REMINDER_FAILURE_SEND_FAILED)
+        self.assertIsNone(outcomes["r-raises"]["sentAt"])
+
+        # 2. The other due reminder still processes successfully.
+        # 3. Its sentAt comes from the injected `now`, not real wall-clock time.
+        self.assertEqual(outcomes["r-ok"]["status"], "sent")
+        self.assertEqual(outcomes["r-ok"]["sentAt"], now.isoformat())
+        self.assertIsNone(outcomes["r-ok"]["failureReason"])
+
+        # Both outcomes are actually persisted, not just returned in memory.
+        saved = {r["id"]: r for r in self._read_reminders()}
+        self.assertEqual(saved["r-raises"]["status"], "failed")
+        self.assertEqual(saved["r-ok"]["status"], "sent")
+
     def test_non_due_reminders_remain_unchanged(self):
         now = datetime(2026, 12, 1, tzinfo=timezone.utc)
         future_send_at = now + timedelta(days=1)

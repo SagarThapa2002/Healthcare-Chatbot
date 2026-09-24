@@ -20,12 +20,15 @@ small, explicit duplication over a shared-utility import that would
 otherwise invert the dependency direction.
 """
 import json
+import logging
 import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from backend import reminder_config
+
+logger = logging.getLogger(__name__)
 
 REMINDERS_FILE = os.path.join(os.path.dirname(__file__), 'reminders.json')
 
@@ -426,6 +429,19 @@ def process_due_reminders(send, now=None, path=None, appointments_path=None):
     exactly two send-related outcomes, never an arbitrary string from the
     caller.
 
+    Phase 6.2-C: if `send` itself raises (a future real provider's
+    network timeout, malformed response, etc. - an ordinary, expected
+    external I/O failure, not a data-integrity problem) the exception is
+    caught and isolated to that ONE reminder - treated exactly like a
+    `False` return (failed/REMINDER_FAILURE_SEND_FAILED) - and processing
+    continues with the remaining due reminders in this same call. Only
+    the exception's type is logged, never its text or any reminder/
+    appointment content (see backend/LOGGING_NOTES.md). This is
+    deliberately different from a malformed reminder *record*, which
+    still aborts the whole run (see get_due_reminders) - a corrupt record
+    in this module's own store is worth stopping for; a flaky external
+    call is not.
+
     Before `send` is ever called, the reminder's appointment is looked up
     fresh (via `appointments_path`/APPOINTMENTS_FILE, see
     _find_appointment) and re-checked:
@@ -487,12 +503,35 @@ def process_due_reminders(send, now=None, path=None, appointments_path=None):
             reminder["failureReason"] = REMINDER_FAILURE_APPOINTMENT_NOT_FOUND
         elif not _is_active(appointment):
             reminder["status"] = _STATUS_CANCELLED
-        elif send(reminder, appointment):
-            reminder["status"] = _STATUS_SENT
-            reminder["sentAt"] = current.isoformat()
         else:
-            reminder["status"] = _STATUS_FAILED
-            reminder["failureReason"] = REMINDER_FAILURE_SEND_FAILED
+            # `send` is the delivery seam (see this function's own
+            # docstring and REMINDER_NOTES.md) - today a test stub, later
+            # a real provider that can genuinely raise (a network
+            # timeout, a malformed API response, etc.). That's an
+            # ordinary, expected-to-happen external I/O failure mode, not
+            # a data-integrity problem - unlike a malformed *record*
+            # (which this module still fails loudly on, deliberately,
+            # via get_due_reminders/_validate_reminder), a raising sender
+            # must not be allowed to abort every other reminder in this
+            # same batch. Caught here, isolated to exactly this one
+            # reminder, and treated as an ordinary delivery failure -
+            # only the exception's type is logged, never its text or any
+            # reminder/appointment content, matching
+            # backend/LOGGING_NOTES.md's existing metadata-only policy.
+            try:
+                delivered = send(reminder, appointment)
+            except Exception as e:
+                logger.warning(
+                    "reminder send raised an exception - exception_type=%s", type(e).__name__
+                )
+                delivered = False
+
+            if delivered:
+                reminder["status"] = _STATUS_SENT
+                reminder["sentAt"] = current.isoformat()
+            else:
+                reminder["status"] = _STATUS_FAILED
+                reminder["failureReason"] = REMINDER_FAILURE_SEND_FAILED
 
         _save_reminders(reminders, path=path)
         processed.append(reminder)
