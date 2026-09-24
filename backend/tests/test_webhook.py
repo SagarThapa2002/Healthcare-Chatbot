@@ -1,10 +1,11 @@
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from app import app
-from backend import availability_service, chatbot_logic
+from backend import availability_service, chatbot_logic, reminder_service
 
 
 class WebhookTestCase(unittest.TestCase):
@@ -347,6 +348,143 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
 
         self.assertTrue(data["success"])
         self.assertIn("couldn't find an appointment", data["messages"][0]["content"]["text"])
+
+
+class GetRemindersTest(unittest.TestCase):
+    """Isolated tests for GET /webhook/reminders - self-contained, not a
+    subclass of WebhookTestCase above (that class isolates only
+    chatbot_logic's/availability_service's own APPOINTMENTS_FILE-family
+    constants, never reminder_service.REMINDERS_FILE). Every test here
+    redirects reminder_service.REMINDERS_FILE to a temp path first, so
+    the real backend/reminders.json is never read from or written to by
+    any test in this class - and backend/appointments.json is never even
+    referenced by this read-only, appointment-data-free endpoint.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.reminders_file = os.path.join(self.tmp_dir.name, 'reminders.json')
+
+        patcher = patch.object(reminder_service, 'REMINDERS_FILE', self.reminders_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.client = app.test_client()
+
+    def _write_reminders(self, reminders):
+        with open(self.reminders_file, 'w') as f:
+            json.dump(reminders, f)
+
+    def test_empty_reminders_file_returns_empty_list(self):
+        self._write_reminders([])
+
+        response = self.client.get('/webhook/reminders')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), [])
+
+    def test_missing_reminders_file_returns_empty_list(self):
+        # self.reminders_file is deliberately never created in this test -
+        # reminder_service.list_reminders() must tolerate a missing file.
+        response = self.client.get('/webhook/reminders')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), [])
+
+    def test_populated_reminder_is_returned_with_exact_fields(self):
+        reminder = {
+            "id": "r1",
+            "appointmentId": "a1",
+            "type": "24h_before",
+            "sendAt": "2026-12-01T00:00:00+00:00",
+            "status": "pending",
+            "createdAt": "2026-11-01T00:00:00+00:00",
+            "sentAt": None,
+            "failureReason": None,
+        }
+        self._write_reminders([reminder])
+
+        response = self.client.get('/webhook/reminders')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), [reminder])
+
+    def test_multiple_mixed_status_reminders_are_all_returned(self):
+        reminders = [
+            {
+                "id": "r-pending", "appointmentId": "a1", "type": "24h_before",
+                "sendAt": "2026-12-01T00:00:00+00:00", "status": "pending",
+                "createdAt": "2026-11-01T00:00:00+00:00", "sentAt": None, "failureReason": None,
+            },
+            {
+                "id": "r-sent", "appointmentId": "a2", "type": "24h_before",
+                "sendAt": "2026-01-01T00:00:00+00:00", "status": "sent",
+                "createdAt": "2025-12-01T00:00:00+00:00", "sentAt": "2026-01-01T00:00:00+00:00",
+                "failureReason": None,
+            },
+            {
+                "id": "r-failed", "appointmentId": "a3", "type": "24h_before",
+                "sendAt": "2026-02-01T00:00:00+00:00", "status": "failed",
+                "createdAt": "2026-01-01T00:00:00+00:00", "sentAt": None,
+                "failureReason": "send_failed",
+            },
+            {
+                "id": "r-cancelled", "appointmentId": "a4", "type": "24h_before",
+                "sendAt": "2026-03-01T00:00:00+00:00", "status": "cancelled",
+                "createdAt": "2026-02-01T00:00:00+00:00", "sentAt": None, "failureReason": None,
+            },
+        ]
+        self._write_reminders(reminders)
+
+        response = self.client.get('/webhook/reminders')
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(len(body), 4)
+        statuses = {r["id"]: r["status"] for r in body}
+        self.assertEqual(
+            statuses,
+            {"r-pending": "pending", "r-sent": "sent", "r-failed": "failed", "r-cancelled": "cancelled"},
+        )
+
+    def test_response_never_contains_appointment_domain_fields(self):
+        reminder = {
+            "id": "r1", "appointmentId": "a1", "type": "24h_before",
+            "sendAt": "2026-12-01T00:00:00+00:00", "status": "pending",
+            "createdAt": "2026-11-01T00:00:00+00:00", "sentAt": None, "failureReason": None,
+        }
+        self._write_reminders([reminder])
+
+        response = self.client.get('/webhook/reminders')
+
+        body = response.get_json()
+        for forbidden_field in ("name", "date", "time", "providerId", "durationMinutes"):
+            self.assertNotIn(forbidden_field, body[0])
+
+    def test_real_repository_data_files_are_not_touched(self):
+        real_reminders_path = os.path.join(os.path.dirname(reminder_service.__file__), 'reminders.json')
+        real_appointments_path = os.path.join(
+            os.path.dirname(reminder_service.__file__), 'appointments.json'
+        )
+        with open(real_reminders_path) as f:
+            before_reminders = f.read()
+        with open(real_appointments_path) as f:
+            before_appointments = f.read()
+
+        self._write_reminders([{
+            "id": "r1", "appointmentId": "a1", "type": "24h_before",
+            "sendAt": "2026-12-01T00:00:00+00:00", "status": "pending",
+            "createdAt": "2026-11-01T00:00:00+00:00", "sentAt": None, "failureReason": None,
+        }])
+        self.client.get('/webhook/reminders')
+
+        with open(real_reminders_path) as f:
+            after_reminders = f.read()
+        with open(real_appointments_path) as f:
+            after_appointments = f.read()
+        self.assertEqual(before_reminders, after_reminders)
+        self.assertEqual(before_appointments, after_appointments)
 
 
 if __name__ == '__main__':

@@ -637,3 +637,76 @@ already-terminal reminder is left untouched - plus a direct checksum-style
 comparison proving the real repository's `backend/reminders.json` and
 `backend/appointments.json` are never read or written by any test in that
 class.
+
+## Reminder visibility endpoint (Phase 6.2-F)
+
+`GET /webhook/reminders` (`backend/webhook.py`) exposes
+`reminder_service.list_reminders()` over HTTP, read-only - the first (and,
+as of this slice, only) way to observe reminder state without opening
+`backend/reminders.json` by hand or running `python -m
+backend.run_due_reminders --dry-run` (which only ever reports a single
+aggregate count, by design - see the Phase 6.2-D section above).
+
+### What it does
+
+Mirrors the existing `GET /webhook/appointments` → `list_appointments()`
+route (`backend/webhook.py`, unchanged by this slice) exactly:
+
+```python
+@webhook_bp.route('/reminders', methods=['GET'])
+def get_reminders():
+    return jsonify(reminder_service.list_reminders())
+```
+
+**Response shape**: the raw JSON array `reminder_service.list_reminders()`
+already returns - each element the full reminder record (`id`,
+`appointmentId`, `type`, `sendAt`, `status`, `createdAt`, `sentAt`,
+`failureReason`), in file order. No `response_model` envelope (no
+`success`/`error`/`context`/`meta` wrapper) - deliberately consistent with
+`GET /webhook/appointments`'s own existing, unwrapped shape, not the
+`/webhook` POST route's structured contract, so the app's two GET routes
+stay shaped the same way as each other.
+
+**Source**: `reminder_service.list_reminders()`, unmodified by this slice -
+already existed, already used internally by `process_due_reminders()`,
+already returns `[]` for a missing or malformed `reminders.json` (see its
+own docstring) rather than raising. This endpoint inherits that same
+tolerance for free and therefore has no new failure mode of its own: it
+cannot 500 on reminder data it never validates.
+
+### No new reminder mutation behavior
+
+This slice adds **zero** reminder domain logic and touches **no** mutation
+path. `backend/reminder_service.py`, `backend/reminder_config.py`,
+`backend/mock_notification_provider.py`, `backend/run_due_reminders.py`,
+and `backend/chatbot_logic.py` are all unmodified by this slice. The new
+route cannot create, update, cancel, or otherwise transition any reminder
+or appointment record - it only reads whatever `reminders.json` (or, in
+tests, a redirected temp file) already contains at request time, the same
+way `GET /webhook/appointments` already does for appointments.
+
+### Privacy
+
+A reminder record carries no patient-identifying content - no name, date,
+time, provider, or contact information; all of that stays exclusively in
+`appointments.json`, referenced only by an opaque `appointmentId` (see the
+"Privacy" section above, Phase 6.2-A, unchanged). This endpoint is
+therefore no more sensitive than the existing, already-unauthenticated
+`GET /webhook/appointments` route - if anything, less so, since that route
+does return `name`/`date`/`time` directly. No authentication/authorization
+was added by this slice, matching the existing precedent; this remains
+this project's stated synthetic/demo-data-only posture (see `README.md`),
+not a production-readiness claim.
+
+### Testing
+
+`backend/tests/test_webhook.py`'s new `GetRemindersTest` class redirects
+`reminder_service.REMINDERS_FILE` to a temp path (the same isolation
+pattern used throughout this project's own reminder tests) and covers: an
+empty store, a missing store file entirely, a single populated reminder
+returned with its exact fields, multiple reminders across all four
+statuses (`pending`/`sent`/`failed`/`cancelled`) all returned together, a
+direct assertion that no appointment-domain field ever appears in the
+response, and a direct before/after comparison proving the real
+repository's `backend/reminders.json` and `backend/appointments.json` are
+never read or written by any test in the class.

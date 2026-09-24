@@ -2,7 +2,7 @@ import logging
 
 from flask import Blueprint, request, jsonify
 
-from backend import response_model
+from backend import reminder_service, response_model
 from backend.chatbot_logic import handle_webhook_request, list_appointments
 
 logger = logging.getLogger(__name__)
@@ -42,3 +42,16 @@ def webhook():
 @webhook_bp.route('/appointments', methods=['GET'])
 def get_appointments():
     return jsonify(list_appointments())
+
+
+@webhook_bp.route('/reminders', methods=['GET'])
+def get_reminders():
+    # Read-only - mirrors get_appointments() above exactly. Returns the
+    # raw reminder record array as-is: reminder_service.list_reminders()
+    # already tolerates a missing/malformed reminders.json by returning
+    # [] (see its own docstring), so there is no new failure mode here to
+    # handle. Reminder records carry no patient-identifying content (no
+    # name/date/time - those stay in appointments.json, referenced only
+    # by an opaque appointmentId), so this is no more sensitive than the
+    # existing /appointments endpoint above - if anything, less so.
+    return jsonify(reminder_service.list_reminders())
