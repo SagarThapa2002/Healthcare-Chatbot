@@ -408,3 +408,77 @@ the approved decisions for when one is:
   chosen provider supports one (many email/SMS APIs do), so a crash-and-
   retry doesn't risk a genuine duplicate message to the patient even though
   the reminder *record* itself is at-least-once, not exactly-once.
+
+## CLI execution boundary (Phase 6.2-D)
+
+`backend/run_due_reminders.py` is the sanctioned execution boundary for
+due-reminder processing - the one place anything is meant to actually
+*invoke* `get_due_reminders()`/`process_due_reminders()` outside of tests.
+It owns only argument parsing, exit codes, and metadata-only logging; it
+contains **no** reminder domain logic of its own (eligibility, scheduling,
+state transitions, and appointment lookup all remain exclusively in
+`reminder_service.py`/`reminder_config.py`, unchanged by this slice).
+
+```
+external scheduler (future) → python -m backend.run_due_reminders
+                                   → reminder_service.get_due_reminders() /
+                                     process_due_reminders(...)
+                                   → future notification sender
+```
+
+**Command:** `python -m backend.run_due_reminders`
+
+**`--dry-run`:** completely non-mutating - calls only `get_due_reminders()`,
+never `process_due_reminders()`, never touches `reminders.json` or
+`appointments.json`, never invokes any sender. Reports a single safe
+aggregate count (`Due reminders: N`) - never a reminder id, appointment
+name/date/time, or any other per-record detail. Zero due reminders is a
+normal, quiet success (exit `0`), not a warning.
+
+**No real sender exists yet, so normal (non-dry-run) execution is
+intentionally unavailable.** Marking reminders as `sent` with nothing
+actually delivered would write false, misleading records into
+`reminders.json` - a real correctness problem, not just a cosmetic one, for
+a healthcare-adjacent record. `python -m backend.run_due_reminders` with no
+flags therefore refuses immediately and deterministically
+(`EXIT_NO_SENDER_CONFIGURED`), without calling `process_due_reminders()` or
+even `get_due_reminders()` - nothing in either JSON store is touched by this
+path. This is deliberately the *only* thing that path does, so it is
+trivial to replace once a real sender exists: construct the configured
+sender and call `reminder_service.process_due_reminders(send=that_sender)`
+- nothing else in this module needs to change.
+
+**Exit codes** (stable, so a future trigger can alert on them without
+parsing log output): `0` success (including zero due reminders, and
+including a dry run reporting due reminders); `1` malformed reminder data
+(`ReminderDataError`); `2` any other runtime failure; `3` a normal mutating
+invocation attempted with no sender configured. An individual reminder
+*outcome* (`failed`/`cancelled`) from `process_due_reminders()`, once a
+real sender exists and this path is wired up, is not and must not become a
+non-zero exit - that is already a correctly-modeled, expected state inside
+`reminder_service.py`, not a process failure.
+
+**Logging** follows the exact same metadata-only policy as the rest of this
+project (`backend/LOGGING_NOTES.md`): only aggregate counts and exception
+*type* names are ever logged - never appointment names/dates/times,
+reminder ids, notification content, contact details, or a raw exception
+message (which could echo reminder/appointment content).
+
+**A future scheduler (cron, launchd, a cloud job runner) should invoke this
+CLI, not import `reminder_service` directly.** This keeps the domain module
+free of any scheduler-shaped assumptions and gives every future trigger
+mechanism one stable, testable, already-logged entry point instead of each
+reinventing its own call site.
+
+**Concurrent invocation remains an unresolved JSON-storage limitation,
+unchanged by this slice.** No locking - file-based or distributed - is
+introduced here, and none is needed yet: this CLI adds a way to *invoke*
+`process_due_reminders()` externally, but doesn't itself run repeatedly or
+concurrently, so it doesn't make the existing, already-documented
+concurrent-invocation risk (see "Concurrency" above) any worse. Solving it
+remains explicitly deferred to whichever future phase introduces a real
+scheduler and/or a transactional datastore.
+
+**Still not introduced by this slice:** a real notification provider, any
+contact/destination data, and any retry policy - all remain exactly as
+deferred as before.
