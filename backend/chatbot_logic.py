@@ -27,6 +27,8 @@ from backend import assistant_service
 from backend import availability_service
 from backend import llm_config
 from backend import provider_repository
+from backend import reminder_config
+from backend import reminder_service
 from backend import response_model
 
 logger = logging.getLogger(__name__)
@@ -926,10 +928,42 @@ def _handle_update_confirm_yes():
         target['time'] = new_time
 
     _save_appointments(appointments)
+    _reschedule_reminders(target)
     os.remove(PENDING_UPDATE_FILE)
 
     text = f"Your appointment for {target['name']} has been updated to {target['date']} at {target['time']}."
     return [response_model.text_message(text)], _UPDATE_STAGE_UPDATED
+
+
+def _reschedule_reminders(appointment):
+    """Phase 6.2-A: cancels any pending 24h_before reminder for
+    `appointment` and creates a fresh one for its new date/time, if
+    eligible (backend/reminder_service.py). Called only from
+    _handle_update_confirm_yes above, immediately after the appointment's
+    date/time have actually been mutated and saved - _handle_update_appointment
+    never reaches its own confirm stage without at least one of date/time
+    changing, so this call is unconditional here, not gated on a separate
+    "did anything change" check.
+
+    Reminders are an additive, best-effort foundation with no delivery
+    channel wired to them yet (see backend/REMINDER_NOTES.md) - a
+    reminder-scheduling problem (most likely a missing/invalid
+    CLINIC_TIMEZONE - reminder_config.ReminderConfigError) must never
+    prevent the appointment update itself from succeeding, so any
+    exception here is caught and only its type is logged (never its text
+    or any appointment content - see backend/LOGGING_NOTES.md), never
+    re-raised. This is a deliberate resilience choice for this slice, not
+    part of the reminder domain logic itself.
+    """
+    try:
+        reminder_service.cancel_pending_reminder(
+            appointment.get('id'), reminder_service.REMINDER_TYPE_24H_BEFORE
+        )
+        reminder_service.create_reminder(appointment, reminder_service.REMINDER_TYPE_24H_BEFORE)
+    except Exception as e:
+        logger.warning(
+            "reminder rescheduling skipped after update - exception_type=%s", type(e).__name__
+        )
 
 
 def _handle_update_confirm_no():
@@ -1143,10 +1177,34 @@ def _handle_cancel_confirm_yes():
 
     target['status'] = 'cancelled'
     _save_appointments(appointments)
+    _cancel_reminders(target)
     os.remove(PENDING_CANCELLATION_FILE)
 
     text = f"Your appointment for {target['name']} on {target['date']} at {target['time']} has been cancelled."
     return [response_model.text_message(text)], _CANCELLATION_STAGE_CANCELLED
+
+
+def _cancel_reminders(appointment):
+    """Phase 6.2-A: cancels any pending 24h_before reminder for
+    `appointment` (backend/reminder_service.py). Called only from
+    _handle_cancel_confirm_yes above, immediately after the appointment's
+    status has actually been set to "cancelled" and saved. See
+    _reschedule_reminders's own docstring for why any exception here is
+    caught and only its type logged, never re-raised - a reminder-
+    subsystem problem must never affect the cancellation itself. In
+    practice this can't raise reminder_config.ReminderConfigError at all
+    (cancelling never computes a sendAt), but the same broad, non-raising
+    safety net is applied here anyway for consistency and future-proofing.
+    """
+    try:
+        reminder_service.cancel_pending_reminder(
+            appointment.get('id'), reminder_service.REMINDER_TYPE_24H_BEFORE
+        )
+    except Exception as e:
+        logger.warning(
+            "reminder cancellation skipped after appointment cancellation - exception_type=%s",
+            type(e).__name__,
+        )
 
 
 def _handle_cancel_confirm_no():
