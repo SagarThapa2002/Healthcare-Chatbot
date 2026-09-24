@@ -24,6 +24,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from backend import mock_notification_provider, reminder_service, run_due_reminders
@@ -54,7 +55,9 @@ class DryRunTest(unittest.TestCase):
         exit_code = run_due_reminders.main(["--dry-run"])
 
         self.assertEqual(exit_code, 0)
-        mock_get_due.assert_called_once_with()
+        # now=None: the default when --now is omitted (see NowOverrideTest
+        # below for --now's own coverage) - unchanged behavior otherwise.
+        mock_get_due.assert_called_once_with(now=None)
         mock_process.assert_not_called()
 
     @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
@@ -167,7 +170,7 @@ class ArgvHandlingTest(unittest.TestCase):
             exit_code = run_due_reminders.main(None)
 
         self.assertEqual(exit_code, 0)
-        mock_get_due.assert_called_once_with()
+        mock_get_due.assert_called_once_with(now=None)
 
     def test_unknown_flag_is_rejected_by_argparse(self):
         with self.assertRaises(SystemExit):
@@ -227,7 +230,7 @@ class ProviderSelectionTest(unittest.TestCase):
             exit_code = run_due_reminders.main([])
 
         self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
-        mock_process.assert_called_once_with(send=mock_notification_provider.send)
+        mock_process.assert_called_once_with(send=mock_notification_provider.send, now=None)
 
     @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
     def test_notification_provider_mock_is_case_insensitive_and_trims_whitespace(self, mock_process):
@@ -236,7 +239,7 @@ class ProviderSelectionTest(unittest.TestCase):
             exit_code = run_due_reminders.main([])
 
         self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
-        mock_process.assert_called_once_with(send=mock_notification_provider.send)
+        mock_process.assert_called_once_with(send=mock_notification_provider.send, now=None)
 
 
 class DryRunProviderIsolationTest(unittest.TestCase):
@@ -255,7 +258,7 @@ class DryRunProviderIsolationTest(unittest.TestCase):
             exit_code = run_due_reminders.main(["--dry-run"])
 
         self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
-        mock_get_due.assert_called_once_with()
+        mock_get_due.assert_called_once_with(now=None)
         mock_process.assert_not_called()
         mock_send.assert_not_called()
 
@@ -418,6 +421,104 @@ class MockProviderEndToEndTest(unittest.TestCase):
             after_appointments = f.read()
         self.assertEqual(before_reminders, after_reminders)
         self.assertEqual(before_appointments, after_appointments)
+
+
+class NowOverrideTest(unittest.TestCase):
+    """Tests for --now (Phase 6.2-G) - a pass-through to reminder_service's
+    own existing `now=` parameter (get_due_reminders()/process_due_reminders()),
+    never new due-detection logic of any kind. reminder_service itself is
+    still mocked here, since these tests are only about whether the right
+    value reaches it - see NowOverrideEndToEndTest below for a real,
+    unmocked state-transition proof.
+    """
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    @patch.object(run_due_reminders.reminder_service, "get_due_reminders", return_value=[])
+    def test_now_omitted_passes_none_to_get_due_reminders(self, mock_get_due, mock_process):
+        exit_code = run_due_reminders.main(["--dry-run"])
+
+        self.assertEqual(exit_code, 0)
+        mock_get_due.assert_called_once_with(now=None)
+        mock_process.assert_not_called()
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    @patch.object(run_due_reminders.reminder_service, "get_due_reminders", return_value=[])
+    def test_now_flag_is_passed_through_to_get_due_reminders_in_dry_run(
+        self, mock_get_due, mock_process
+    ):
+        exit_code = run_due_reminders.main(["--dry-run", "--now", "2027-06-02T00:00:00+00:00"])
+
+        self.assertEqual(exit_code, 0)
+        mock_get_due.assert_called_once_with(now=datetime(2027, 6, 2, 0, 0, 0, tzinfo=timezone.utc))
+        mock_process.assert_not_called()
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders", return_value=[])
+    def test_now_flag_is_passed_through_to_process_due_reminders_in_mutating_mode(self, mock_process):
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "mock"}):
+            exit_code = run_due_reminders.main(["--now", "2027-06-02T00:00:00+00:00"])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        mock_process.assert_called_once_with(
+            send=mock_notification_provider.send,
+            now=datetime(2027, 6, 2, 0, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_malformed_now_value_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            run_due_reminders.main(["--dry-run", "--now", "not-a-timestamp"])
+
+    def test_timezone_naive_now_value_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            run_due_reminders.main(["--dry-run", "--now", "2027-06-02T00:00:00"])
+
+
+class NowOverrideEndToEndTest(unittest.TestCase):
+    """Real pipeline, real (unmocked) reminder_service.process_due_reminders()
+    - mirrors MockProviderEndToEndTest's own isolation pattern above -
+    proving --now actually changes what gets processed, not merely that
+    the right argument value was received.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.reminders_file = os.path.join(self.tmp_dir.name, "reminders.json")
+        self.appointments_file = os.path.join(self.tmp_dir.name, "appointments.json")
+
+        patchers = [
+            patch.object(reminder_service, "REMINDERS_FILE", self.reminders_file),
+            patch.object(reminder_service, "APPOINTMENTS_FILE", self.appointments_file),
+            patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "mock"}),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _write(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _read(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def test_now_override_makes_a_future_reminder_due_and_processes_it(self):
+        # sendAt is a genuinely future instant relative to this environment's
+        # real wall-clock time, so without --now this reminder is not due.
+        future_reminder = make_due_reminder("r-ok", "a1")
+        future_reminder["sendAt"] = "2027-06-01T00:00:00+00:00"
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [future_reminder])
+
+        exit_code = run_due_reminders.main([])
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        self.assertEqual(self._read(self.reminders_file)[0]["status"], "pending")
+
+        exit_code = run_due_reminders.main(["--now", "2027-06-02T00:00:00+00:00"])
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = self._read(self.reminders_file)
+        self.assertEqual(reminders[0]["status"], "sent")
+        self.assertIsNotNone(reminders[0]["sentAt"])
 
 
 if __name__ == "__main__":

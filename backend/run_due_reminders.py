@@ -1,4 +1,4 @@
-"""CLI execution boundary for the due-reminder processor (Phase 6.2-D/E).
+"""CLI execution boundary for the due-reminder processor (Phase 6.2-D/E/G).
 
     external scheduler (future: cron / launchd / a cloud job runner)
         |
@@ -52,6 +52,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 
 from backend import mock_notification_provider
 from backend import reminder_service
@@ -73,6 +74,31 @@ NOTIFICATION_PROVIDER_ENV_VAR = "NOTIFICATION_PROVIDER"
 NOTIFICATION_PROVIDER_MOCK = "mock"
 
 
+def _parse_now(value):
+    """argparse `type=` converter for --now (Phase 6.2-G).
+
+    Raises argparse.ArgumentTypeError - which argparse itself turns into
+    its own usage error and SystemExit(2), exactly matching the existing
+    behavior for an unrecognized flag (see
+    test_unknown_flag_is_rejected_by_argparse) - for anything that isn't
+    a well-formed, timezone-aware ISO-8601 timestamp. No new exit code is
+    introduced for this: an invalid --now value is an argument-parsing
+    problem, not a runtime/data failure, so it's handled the same way
+    every other malformed argument already is.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"--now must be an ISO-8601 timestamp, e.g. 2027-06-02T00:00:00+00:00 (got {value!r})"
+        ) from e
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            f"--now must be timezone-aware (include a UTC offset, e.g. +00:00) - got {value!r}"
+        )
+    return parsed
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m backend.run_due_reminders",
@@ -90,16 +116,35 @@ def _build_parser():
             "appointments.json are never written)."
         ),
     )
+    parser.add_argument(
+        "--now",
+        type=_parse_now,
+        default=None,
+        help=(
+            "Override the 'current instant' used for due-detection - a "
+            "timezone-aware ISO-8601 timestamp (e.g. 2027-06-02T00:00:00+00:00). "
+            "Passed straight through to reminder_service's own existing `now=` "
+            "parameter (get_due_reminders()/process_due_reminders()) - no new "
+            "due-detection logic is added here. Omit it (the default) to use "
+            "the real current time, exactly as before this option existed."
+        ),
+    )
     return parser
 
 
-def _run_dry_run():
+def _run_dry_run(now=None):
     """Read-only: calls only get_due_reminders() (never process_due_reminders()),
     so nothing is ever mutated and no sender is ever invoked. Reports a
     single safe aggregate count - never per-reminder detail.
+
+    `now`, if given (Phase 6.2-G's --now override), is passed straight
+    through to get_due_reminders()'s own existing `now=` parameter - no
+    due-detection logic of any kind lives here. Omitted (None), due
+    detection uses the real current time exactly as before this option
+    existed.
     """
     try:
-        due = reminder_service.get_due_reminders()
+        due = reminder_service.get_due_reminders(now=now)
     except reminder_service.ReminderDataError as e:
         logger.error(
             "dry run aborted - malformed reminder data - exception_type=%s", type(e).__name__
@@ -137,7 +182,7 @@ def _select_sender():
     return None
 
 
-def _run_mutating():
+def _run_mutating(now=None):
     """Selects a notification sender from configuration (see
     _select_sender) and, only if one is configured, calls the REAL
     reminder_service.process_due_reminders(send=sender) - never a stub,
@@ -151,6 +196,12 @@ def _run_mutating():
     6.2-D. Marking reminders as `sent` with nothing actually delivered
     would write false, misleading records into reminders.json, so this
     refusal stays the default until a sender is explicitly configured.
+
+    `now`, if given (Phase 6.2-G's --now override), is passed straight
+    through to process_due_reminders()'s own existing `now=` parameter -
+    no due-detection or state-transition logic of any kind lives here.
+    Omitted (None), processing uses the real current time exactly as
+    before this option existed.
 
     A completed processing run is reported as EXIT_OK even when
     individual reminders end up `failed`/`cancelled` - those are already
@@ -171,7 +222,7 @@ def _run_mutating():
         return EXIT_NO_SENDER_CONFIGURED
 
     try:
-        processed = reminder_service.process_due_reminders(send=sender)
+        processed = reminder_service.process_due_reminders(send=sender, now=now)
     except reminder_service.ReminderDataError as e:
         logger.error(
             "reminder processing aborted - malformed reminder data - exception_type=%s",
@@ -199,12 +250,16 @@ def main(argv=None):
     (see the EXIT_* constants above) - never raises; every exception this
     function's own callees can produce is caught and mapped to a safe,
     logged, non-zero exit code.
+
+    `args.now` (Phase 6.2-G's --now override, already parsed into an
+    aware datetime by _parse_now, or None if the flag was omitted) is
+    passed straight through to whichever path is dispatched to below.
     """
     args = _build_parser().parse_args(argv)
 
     if args.dry_run:
-        return _run_dry_run()
-    return _run_mutating()
+        return _run_dry_run(now=args.now)
+    return _run_mutating(now=args.now)
 
 
 if __name__ == "__main__":

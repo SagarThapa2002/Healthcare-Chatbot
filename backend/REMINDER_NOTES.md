@@ -710,3 +710,75 @@ direct assertion that no appointment-domain field ever appears in the
 response, and a direct before/after comparison proving the real
 repository's `backend/reminders.json` and `backend/appointments.json` are
 never read or written by any test in the class.
+
+## `--now` override (Phase 6.2-G)
+
+`python -m backend.run_due_reminders` gains one new optional argument:
+`--now ISO_8601_TIMESTAMP`. It is a pure pass-through to the `now=`
+parameter `reminder_service.get_due_reminders()`/`process_due_reminders()`
+have already accepted since Phase 6.2-A/6.2-B - **no due-detection or
+state-transition logic was added anywhere**, in this module or
+`reminder_service.py` (which is unmodified by this slice). Every domain
+function already supported deterministic `now` injection for exactly this
+reason; the CLI - "the sanctioned execution boundary" (see the Phase
+6.2-D section above) - was the one caller inconsistent with that, since it
+always computed the real current time implicitly. This slice closes that
+gap and nothing else.
+
+### Why this exists
+
+Before this slice, exercising the CLI's real mutating pipeline
+end-to-end (`python -m backend.run_due_reminders` with
+`NOTIFICATION_PROVIDER=mock`, actually watching a reminder move from
+`pending` to `sent`) required either waiting for a real reminder's
+`sendAt` to actually arrive, or hand-editing `reminders.json`'s `sendAt`
+to a past timestamp. `--now` makes the whole, already-built pipeline -
+booking → `reminder_service.create_reminder()` → `reminders.json` →
+`python -m backend.run_due_reminders --now ...` → real
+`process_due_reminders()` → `mock_notification_provider.send()` →
+persisted terminal state, visible via `GET /webhook/reminders` (Phase
+6.2-F) - runnable and demonstrable on demand, without waiting real
+calendar time.
+
+### Validation
+
+`--now` accepts only a well-formed, **timezone-aware** ISO-8601 timestamp
+(e.g. `2027-06-02T00:00:00+00:00`) - parsed via `_parse_now()`, an
+`argparse` `type=` converter. Anything else - malformed input, or a valid
+but timezone-*naive* timestamp (no UTC offset) - raises
+`argparse.ArgumentTypeError`, which `argparse` itself turns into its own
+usage error and `SystemExit(2)`. This is the exact same failure path an
+unrecognized flag (e.g. `--not-a-real-flag`) already used before this
+slice - **no new exit code was introduced**; an invalid `--now` value is
+an argument-parsing problem, not a runtime/data failure, so it is handled
+the same way every other malformed argument already was.
+
+### Default behavior is unchanged
+
+Omitting `--now` (the default, `None`) behaves exactly as before this
+slice existed: `get_due_reminders()`/`process_due_reminders()` fall back
+to `datetime.now(timezone.utc)` internally, exactly as they always have.
+Every exit code, every log line, and every prior test's behavior is
+unchanged when `--now` is not given.
+
+### Scope
+
+This slice touched only `backend/run_due_reminders.py` and its own tests.
+No new domain logic, no schema change, no new dependency, no new exit
+code, and no scheduler/provider/retry/locking capability was added -
+`reminder_service.py`, `reminder_config.py`, `mock_notification_provider.py`,
+and `webhook.py` are all unmodified.
+
+### Testing
+
+`backend/tests/test_run_due_reminders.py` adds `NowOverrideTest` (still
+mocking `reminder_service`, since these tests are only about whether the
+right value reaches it): omitted `--now` passes `now=None`; a valid
+`--now` is passed through unchanged to `get_due_reminders()` in dry-run
+mode and to `process_due_reminders()` in mutating mode; a malformed value
+and a timezone-naive value are each rejected via `SystemExit`. It also
+adds `NowOverrideEndToEndTest`, which - mirroring
+`MockProviderEndToEndTest`'s own real, unmocked isolation pattern -
+proves a reminder whose `sendAt` is genuinely in the future is left
+`pending` without `--now`, and is actually processed to `sent` by the
+real `process_due_reminders()` once `--now` is set past its `sendAt`.
