@@ -1,5 +1,5 @@
-"""Tests for backend/reminder_service.py (Phase 6.2-A), plus integration
-tests proving chatbot_logic.py's two reminder hooks
+"""Tests for backend/reminder_service.py (Phase 6.2-A and 6.2-B), plus
+integration tests proving chatbot_logic.py's two reminder hooks
 (_reschedule_reminders / _cancel_reminders) are actually wired up.
 
 Every test isolates reminders.json (and, for the integration classes,
@@ -13,7 +13,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import app
 from backend import availability_service, chatbot_logic, reminder_config, reminder_service
@@ -340,6 +340,211 @@ class DueReminderTest(ReminderServiceTestCase):
         well_after = datetime.fromisoformat(created["sendAt"]) + timedelta(days=1)
         due = reminder_service.get_due_reminders(now=well_after, path=self.reminders_file)
         self.assertEqual(due, [])
+
+
+def make_reminder(**overrides):
+    reminder = {
+        "id": "r1",
+        "appointmentId": "a1",
+        "type": "24h_before",
+        "sendAt": datetime(2026, 12, 1, tzinfo=timezone.utc).isoformat(),
+        "status": "pending",
+        "createdAt": datetime(2026, 11, 1, tzinfo=timezone.utc).isoformat(),
+        "sentAt": None,
+        "failureReason": None,
+    }
+    reminder.update(overrides)
+    return reminder
+
+
+class ProcessDueRemindersTest(ReminderServiceTestCase):
+    """Tests for process_due_reminders() (Phase 6.2-B). CLINIC_TIMEZONE is
+    still set by the base class's setUp, but every test here deliberately
+    never relies on it - send/failed/cancelled outcomes and due-detection
+    are fully determined by stored (already-UTC) sendAt values and the
+    injected `now`, proving due processing has no timezone dependency.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
+
+    def _write_appointments(self, appointments):
+        with open(self.appointments_file, 'w') as f:
+            json.dump(appointments, f)
+
+    def _write_reminders(self, reminders):
+        with open(self.reminders_file, 'w') as f:
+            json.dump(reminders, f)
+
+    def _active_appointment(self, appointment_id="a1"):
+        return {
+            "id": appointment_id, "name": "Test Patient", "providerId": "dr-patel",
+            "date": "2026-12-28", "time": "10:00",
+        }
+
+    def test_exact_due_boundary_is_processed(self):
+        send_at = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=send_at.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=send_at, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(processed[0]["status"], "sent")
+
+    def test_one_second_before_boundary_is_not_processed(self):
+        send_at = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=send_at.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        one_second_early = send_at - timedelta(seconds=1)
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=one_second_early,
+            path=self.reminders_file, appointments_path=self.appointments_file,
+        )
+        self.assertEqual(processed, [])
+        saved = self._read_reminders()
+        self.assertEqual(saved[0]["status"], "pending")
+
+    def test_successful_send_transitions_to_sent_with_send_at_timestamp(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=now.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed[0]["status"], "sent")
+        self.assertEqual(processed[0]["sentAt"], now.isoformat())
+        self.assertIsNone(processed[0]["failureReason"])
+
+    def test_failed_send_transitions_to_failed_with_send_failed_reason(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=now.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: False, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed[0]["status"], "failed")
+        self.assertEqual(processed[0]["failureReason"], reminder_service.REMINDER_FAILURE_SEND_FAILED)
+        self.assertIsNone(processed[0]["sentAt"])
+
+    def test_missing_appointment_transitions_to_failed_with_not_found_reason(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=now.isoformat())])
+        self._write_appointments([])  # no matching appointment record at all
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed[0]["status"], "failed")
+        self.assertEqual(processed[0]["failureReason"], reminder_service.REMINDER_FAILURE_APPOINTMENT_NOT_FOUND)
+
+    def test_cancelled_appointment_transitions_reminder_to_cancelled(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=now.isoformat())])
+        appt = self._active_appointment()
+        appt["status"] = "cancelled"
+        self._write_appointments([appt])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed[0]["status"], "cancelled")
+        self.assertIsNone(processed[0]["failureReason"])
+        self.assertIsNone(processed[0]["sentAt"])
+
+    def test_repeated_processing_is_idempotent(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=now.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        send = Mock(return_value=True)
+        first = reminder_service.process_due_reminders(
+            send, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        second = reminder_service.process_due_reminders(
+            send, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertEqual(send.call_count, 1)
+
+    def test_terminal_reminders_are_ignored(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([
+            make_reminder(id="r-sent", status="sent", sentAt=now.isoformat(), sendAt=now.isoformat()),
+            make_reminder(id="r-failed", status="failed", failureReason="send_failed", sendAt=now.isoformat()),
+            make_reminder(id="r-cancelled", status="cancelled", sendAt=now.isoformat()),
+        ])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed, [])
+
+    def test_malformed_reminder_raises_and_processes_nothing(self):
+        self._write_reminders([{"id": "bad", "appointmentId": "a1", "type": "24h_before"}])
+        with self.assertRaises(reminder_service.ReminderDataError):
+            reminder_service.process_due_reminders(
+                lambda r, a: True, path=self.reminders_file, appointments_path=self.appointments_file
+            )
+
+    def test_multiple_reminders_receive_independent_outcomes(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self._write_reminders([
+            make_reminder(id="r-ok", appointmentId="a-ok", sendAt=now.isoformat()),
+            make_reminder(id="r-fail", appointmentId="a-fail", sendAt=now.isoformat()),
+            make_reminder(id="r-missing", appointmentId="a-missing", sendAt=now.isoformat()),
+        ])
+        self._write_appointments([
+            self._active_appointment("a-ok"),
+            self._active_appointment("a-fail"),
+            # "a-missing" is intentionally absent.
+        ])
+
+        def send(reminder, appointment):
+            return reminder["id"] == "r-ok"
+
+        processed = reminder_service.process_due_reminders(
+            send, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        outcomes = {r["id"]: r["status"] for r in processed}
+        self.assertEqual(outcomes, {"r-ok": "sent", "r-fail": "failed", "r-missing": "failed"})
+        reasons = {r["id"]: r["failureReason"] for r in processed}
+        self.assertEqual(reasons["r-fail"], reminder_service.REMINDER_FAILURE_SEND_FAILED)
+        self.assertEqual(reasons["r-missing"], reminder_service.REMINDER_FAILURE_APPOINTMENT_NOT_FOUND)
+
+    def test_non_due_reminders_remain_unchanged(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        future_send_at = now + timedelta(days=1)
+        self._write_reminders([make_reminder(sendAt=future_send_at.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=now, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(processed, [])
+        saved = self._read_reminders()
+        self.assertEqual(saved[0]["status"], "pending")
+
+    def test_no_real_wall_clock_dependency(self):
+        # A `now` far from real wall-clock time, with a matching sendAt,
+        # must still be processed correctly - proving the function never
+        # falls back to a real datetime.now() when `now` is supplied.
+        long_ago = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self._write_reminders([make_reminder(sendAt=long_ago.isoformat())])
+        self._write_appointments([self._active_appointment()])
+
+        processed = reminder_service.process_due_reminders(
+            lambda r, a: True, now=long_ago, path=self.reminders_file, appointments_path=self.appointments_file
+        )
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(processed[0]["sentAt"], long_ago.isoformat())
 
 
 class MalformedReminderRecordTest(ReminderServiceTestCase):

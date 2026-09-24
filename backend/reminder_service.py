@@ -29,6 +29,18 @@ from backend import reminder_config
 
 REMINDERS_FILE = os.path.join(os.path.dirname(__file__), 'reminders.json')
 
+# chatbot_logic.py and availability_service.py each independently compute
+# their own APPOINTMENTS_FILE constant, both pointing at the same real
+# file - see either module's own comment for why (each stays independently
+# importable and testable, with no dependency on the other). This module
+# follows the identical pattern: reading appointments.json directly, here
+# only to re-check an appointment's existence/active status immediately
+# before treating a due reminder as sendable (see process_due_reminders
+# below) - never to import backend.chatbot_logic, which would create a
+# circular import (chatbot_logic.py already imports this module for its
+# two integration hooks).
+APPOINTMENTS_FILE = os.path.join(os.path.dirname(__file__), 'appointments.json')
+
 REMINDER_TYPE_24H_BEFORE = "24h_before"
 
 _STATUS_PENDING = "pending"
@@ -36,6 +48,13 @@ _STATUS_SENT = "sent"
 _STATUS_FAILED = "failed"
 _STATUS_CANCELLED = "cancelled"
 _KNOWN_STATUSES = (_STATUS_PENDING, _STATUS_SENT, _STATUS_FAILED, _STATUS_CANCELLED)
+
+# The only two failure categories process_due_reminders() can produce -
+# fixed, deterministic, domain-safe (see its own docstring): the injected
+# `send` callable reports only a plain bool, never its own category, so
+# these two constants are the complete set for this slice.
+REMINDER_FAILURE_SEND_FAILED = "send_failed"
+REMINDER_FAILURE_APPOINTMENT_NOT_FOUND = "appointment_not_found"
 
 _REQUIRED_REMINDER_FIELDS = (
     "id", "appointmentId", "type", "sendAt", "status", "createdAt", "sentAt", "failureReason",
@@ -136,6 +155,28 @@ def list_reminders(path=None):
         return _read_reminders_raw(path=file_path)
     except json.JSONDecodeError:
         return []
+
+
+def _find_appointment(appointment_id, path=None):
+    """Returns the appointment dict with this id from appointments.json
+    (or `path`), or None if the file is missing, unreadable, or has no
+    matching record. Read-only, read fresh on every call - never writes
+    to appointments.json. Used only by process_due_reminders() to
+    re-check an appointment's current existence/active status
+    immediately before treating a due reminder as sendable.
+    """
+    file_path = path or APPOINTMENTS_FILE
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, 'r') as f:
+            appointments = json.load(f)
+    except json.JSONDecodeError:
+        return None
+    for appointment in appointments:
+        if appointment.get('id') == appointment_id:
+            return appointment
+    return None
 
 
 def _parse_appointment_datetime(appointment):
@@ -362,3 +403,98 @@ def get_due_reminders(now=None, path=None):
         if current >= _parse_send_at(reminder):
             due.append(reminder)
     return due
+
+
+def process_due_reminders(send, now=None, path=None, appointments_path=None):
+    """Phase 6.2-B: processes every currently-due `pending` reminder (see
+    get_due_reminders) exactly once each, transitioning it to a terminal
+    state and persisting that ONE reminder's change immediately - before
+    moving on to the next - rather than batching the whole due set into a
+    single final write. This bounds the unsafe window from a crash
+    between "identified as due" and "terminal state saved" to at most one
+    reminder: the next run would simply re-attempt whichever single
+    reminder didn't get saved, since it would still be `pending` (see
+    backend/REMINDER_NOTES.md for the full design rationale).
+
+    `send(reminder, appointment) -> bool` is REQUIRED (no default) -
+    there is no real delivery channel in this slice (see
+    REMINDER_NOTES.md's deferred provider-abstraction section), so every
+    caller must supply an explicit stub. Only a plain bool is accepted:
+    True -> pending -> sent; False -> pending -> failed with
+    failureReason=REMINDER_FAILURE_SEND_FAILED. `send` cannot supply its
+    own failure category in this slice - deterministic and domain-safe,
+    exactly two send-related outcomes, never an arbitrary string from the
+    caller.
+
+    Before `send` is ever called, the reminder's appointment is looked up
+    fresh (via `appointments_path`/APPOINTMENTS_FILE, see
+    _find_appointment) and re-checked:
+      - missing entirely -> failed, REMINDER_FAILURE_APPOINTMENT_NOT_FOUND
+      - found but no longer active (_is_active) -> cancelled
+      - found and active -> `send(reminder, appointment)` is called
+    This is a deliberate second, independent check. The Phase 6.1
+    cancellation/reschedule hooks (chatbot_logic._cancel_reminders /
+    _reschedule_reminders) already try to keep reminders in sync, but
+    both deliberately swallow any reminder-subsystem failure so the
+    appointment lifecycle itself is never blocked (see their own
+    docstrings) - meaning it's possible, though not expected in normal
+    operation, for a stale pending reminder to survive an appointment's
+    cancellation. This check closes that gap here, cheaply, rather than
+    leaving it unaddressed. It does NOT re-validate that the reminder's
+    stored sendAt still matches the appointment's current date/time (a
+    reschedule-staleness check) - that remains the reschedule hook's own
+    responsibility; re-deriving it here would duplicate that hook's logic.
+
+    Never touches CLINIC_TIMEZONE/reminder_config - sendAt is already
+    stored as UTC (see get_due_reminders), so due processing has no
+    timezone dependency at all.
+
+    `now`, if given, is used both for the due-detection comparison AND as
+    the `sentAt` timestamp on a successful send - the same single instant
+    for the whole call, never re-read per reminder, so tests never depend
+    on real wall-clock timing (matching every other `now` parameter in
+    this module).
+
+    Raises ReminderDataError immediately if any record in reminders.json
+    is malformed (propagated from get_due_reminders, which validates
+    every record in the store, not just due ones) - the whole run aborts
+    rather than skipping the bad record and continuing, consistent with
+    this module's existing "fail loudly, never guess" convention.
+
+    Returns the list of reminder records that were actually transitioned
+    in this call, each carrying its final status/sentAt/failureReason -
+    matching cancel_pending_reminder's own "return what changed"
+    convention. A reminder found to have already changed status by the
+    time its own turn in this loop is reached (e.g. no longer `pending` -
+    this module documents no locking, single-invocation-at-a-time only,
+    see REMINDER_NOTES.md) is silently left alone and excluded from the
+    returned list, rather than guessed at.
+    """
+    current = now if now is not None else datetime.now(timezone.utc)
+    due = get_due_reminders(now=current, path=path)
+
+    processed = []
+    for due_reminder in due:
+        reminders = list_reminders(path=path)
+        reminder = next((r for r in reminders if r["id"] == due_reminder["id"]), None)
+        if reminder is None or reminder["status"] != _STATUS_PENDING:
+            continue
+
+        appointment = _find_appointment(reminder["appointmentId"], path=appointments_path)
+
+        if appointment is None:
+            reminder["status"] = _STATUS_FAILED
+            reminder["failureReason"] = REMINDER_FAILURE_APPOINTMENT_NOT_FOUND
+        elif not _is_active(appointment):
+            reminder["status"] = _STATUS_CANCELLED
+        elif send(reminder, appointment):
+            reminder["status"] = _STATUS_SENT
+            reminder["sentAt"] = current.isoformat()
+        else:
+            reminder["status"] = _STATUS_FAILED
+            reminder["failureReason"] = REMINDER_FAILURE_SEND_FAILED
+
+        _save_reminders(reminders, path=path)
+        processed.append(reminder)
+
+    return processed

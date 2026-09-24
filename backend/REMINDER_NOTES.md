@@ -187,9 +187,9 @@ env-var-driven config with an explicit fail-safe default):
 reminder_service.py           (decides WHAT/WHEN - this slice)
         |
 notification_provider interface:  send(reminder, appointment) -> {"delivered": bool, "category": str}
-        |-- mock_notification_provider.py   (6.2-A's own testing precedent - not built yet)
-        |-- email_notification_provider.py  (Phase 6.2-B)
-        \-- sms_notification_provider.py    (Phase 6.2-C)
+        |-- mock_notification_provider.py   (not built yet)
+        |-- email_notification_provider.py  (a future phase)
+        \-- sms_notification_provider.py    (a future phase)
 ```
 
 Unlike `llm_config.PROVIDER` (which fails safe *toward the real integration*
@@ -197,8 +197,16 @@ on an unrecognized value, since answering a question is low-risk), a future
 `NOTIFICATION_PROVIDER` setting should fail safe *toward the mock* - a
 notification provider that could silently start sending real messages during
 local development or tests would be actively unsafe in a way an LLM answer
-is not. This is a note for 6.2-B, not something built or decided further
-here.
+is not. This is a note for that future phase, not something built or decided
+further here.
+
+Note (Phase 6.2-B): the diagram above describes the eventual real-delivery
+shape. Phase 6.2-B does not build any of it - instead,
+`process_due_reminders()`'s `send` parameter is the seam where a real
+provider will eventually be plugged in, simplified to a plain
+`bool` return for this slice (see "Due processing" below) rather than the
+richer `{"delivered": bool, "category": str}` shape shown above - that
+richer shape, and the actual provider files, remain deferred.
 
 ## Privacy
 
@@ -210,3 +218,107 @@ stored in this slice, since no delivery channel exists yet to justify storing
 one. `failureReason` is a fixed category string, never `str(exception)` -
 matching `backend/LOGGING_NOTES.md`'s existing metadata-only logging policy,
 applied here to reminder failure records as well as to log lines.
+
+## Due processing (Phase 6.2-B)
+
+`reminder_service.process_due_reminders(send, now=None, path=None, appointments_path=None)`
+is the second half of the pipeline built on top of `get_due_reminders()`: it
+finds every currently-due `pending` reminder and transitions each to a
+terminal state. Still no email/SMS/push, no external delivery, no
+scheduler/cron/background worker, and no notification-provider files - see
+the deferred section above.
+
+### The `send` contract is deliberately narrow
+
+`send(reminder, appointment) -> bool` is **required** (no default) - there is
+no real delivery channel in this slice, so every caller (today, only tests)
+must supply an explicit stub. Only a plain `bool` is accepted:
+
+- `True` → `pending` → `sent`
+- `False` → `pending` → `failed`, with `failureReason = REMINDER_FAILURE_SEND_FAILED`
+
+`send` cannot supply its own failure category - a deliberate simplification
+over the richer future provider shape (`{"delivered": bool, "category":
+str}`), to keep this slice's outcomes fully deterministic and
+domain-controlled rather than accepting arbitrary strings from whatever gets
+plugged in later.
+
+### Appointment existence/active re-check
+
+Before `send` is ever called, the reminder's appointment is looked up fresh
+(a new, independently-computed `APPOINTMENTS_FILE` constant in
+`reminder_service.py`, mirroring the exact pattern `chatbot_logic.py` and
+`availability_service.py` already use for the same file - never an import of
+`backend.chatbot_logic`, which would create a circular import):
+
+- appointment missing entirely → `failed`, `failureReason = REMINDER_FAILURE_APPOINTMENT_NOT_FOUND`
+- appointment found but no longer active (`status == "cancelled"`) → `cancelled`
+- appointment found and active → `send(reminder, appointment)` is called
+
+This is a deliberate **second, independent** safety check, not redundant
+busywork: the Phase 6.1 cancellation/reschedule hooks
+(`chatbot_logic._cancel_reminders` / `_reschedule_reminders`) already try to
+keep reminders in sync, but both deliberately swallow any reminder-subsystem
+exception so the appointment lifecycle itself is never blocked (see their own
+docstrings) - meaning it's possible, though not expected in normal operation,
+for a stale `pending` reminder to survive an appointment's cancellation. Due
+processing closes that gap here, cheaply, rather than leaving it
+unaddressed. It does **not** re-validate that the reminder's stored `sendAt`
+still matches the appointment's *current* date/time (a reschedule-staleness
+check) - that remains the reschedule hook's own responsibility; re-deriving
+it here would duplicate that hook's logic.
+
+### No timezone dependency
+
+`process_due_reminders()` never touches `CLINIC_TIMEZONE`/`reminder_config`
+at all - `sendAt` is already stored as UTC (computed once, at creation
+time), so due processing only ever compares UTC to UTC. A missing or invalid
+`CLINIC_TIMEZONE` affects only *new reminder creation*; it has zero effect on
+due-detection or processing of already-created reminders.
+
+### Persistence: one write per reminder, not one batch write
+
+Due reminders are processed **one at a time**: re-check the appointment,
+determine the outcome, save immediately - before moving to the next -
+rather than mutating the whole due list in memory and writing once at the
+end. This bounds a crash between "identified as due" and "terminal state
+saved" to at most one reminder: if the process dies after a successful send
+but before that one reminder's save completes, that reminder is simply still
+`pending` on disk and will be re-attempted on the next run. This is an
+accepted, explicitly-documented at-least-once (not exactly-once) limitation,
+of no real consequence today since no real delivery channel exists yet.
+
+### Concurrency
+
+No file locking is added. This is safe under the stated assumption that only
+one `process_due_reminders()` invocation runs at a time - true today by
+construction, since this slice adds no scheduler/cron/concurrent trigger of
+any kind. The remaining, accepted limitation - an unlocked write racing
+against a cancel/update hook's own write at the exact same instant - is the
+same class of risk already accepted for `appointments.json` and the three
+pending-transaction files since Phase 6.1's very first slice.
+
+### Malformed data: fail loudly, not skip
+
+`get_due_reminders()` validates *every* record in the store on every call
+(not just due ones), so a single malformed reminder anywhere in
+`reminders.json` aborts the whole `process_due_reminders()` run with
+`ReminderDataError`, rather than being silently skipped so the rest of the
+batch can proceed. This is a real, acknowledged tradeoff (one corrupt record
+temporarily blocks every other, otherwise-fine due reminder), chosen for
+consistency with this project's existing "fail loudly, never guess" stance
+(`ProviderDataError`, `AvailabilityError`, `ReminderDataError` itself) rather
+than introducing a new, softer tolerance behavior with no precedent here.
+"Mark it failed and continue" was considered and rejected: a malformed
+record might not even have a valid `id`/`appointmentId` to safely record a
+failure against.
+
+### Idempotency
+
+Guaranteed structurally, not by a separate lock or dedup check:
+`get_due_reminders()` only ever returns `status == "pending"` reminders, and
+processing immediately flips a reminder's status away from `pending` and
+saves before considering the next one - so a reminder is removed from every
+future "due" result the instant it's processed. Calling
+`process_due_reminders()` again immediately (or at any later time) only ever
+sees reminders that genuinely haven't been processed yet.
