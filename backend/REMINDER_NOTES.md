@@ -482,3 +482,158 @@ scheduler and/or a transactional datastore.
 **Still not introduced by this slice:** a real notification provider, any
 contact/destination data, and any retry policy - all remain exactly as
 deferred as before.
+
+## Deterministic mock notification provider (Phase 6.2-E)
+
+`backend/mock_notification_provider.py` is the first concrete implementation
+behind the `send(reminder, appointment) -> bool` delivery seam
+`reminder_service.process_due_reminders()` has exposed since Phase 6.2-B.
+**The seam itself is unchanged** - no signature change, no
+`NotificationSender` Protocol/ABC, and no result object (see the Phase
+6.2-C decisions above, which this slice does not revisit). This is a
+mock, for local/demo/test pipeline validation only - it makes no network
+call, sends nothing to any real destination, and is not, and must not be
+mistaken for, a real email/SMS/push integration.
+
+### Purpose
+
+Until this slice, the CLI's mutating path had never actually run the real
+`process_due_reminders()` with a real callable - only test stubs exercised
+it directly, and `run_due_reminders.py` had nothing to construct for a
+genuine invocation, so it always refused. The mock provider exists solely
+to close that gap: it lets the full pipeline -
+`python -m backend.run_due_reminders` → `reminder_service.process_due_reminders()`
+→ `send()` → a real terminal state persisted to `reminders.json` - run and
+be tested end-to-end, without inventing any real delivery capability.
+
+### `NOTIFICATION_PROVIDER` - explicit opt-in, safe default unchanged
+
+A single new environment variable, read only by `backend/run_due_reminders.py`
+(`_select_sender()`):
+
+- **Unset or blank** (the default) → no sender is selected → `_run_mutating()`
+  refuses immediately with `EXIT_NO_SENDER_CONFIGURED`, exactly as it did
+  before this slice. Nothing in `reminders.json`/`appointments.json` is
+  touched by this path.
+- **`NOTIFICATION_PROVIDER=mock`** (case-insensitive, whitespace-trimmed) →
+  selects `backend.mock_notification_provider.send` and calls the **real**
+  `reminder_service.process_due_reminders(send=...)`.
+- **Any other value** → treated identically to "unset" - `EXIT_NO_SENDER_CONFIGURED`,
+  never a silent fallback to the mock.
+
+This is a deliberate, documented asymmetry with `backend/llm_config.PROVIDER`,
+which falls back to the *real* Claude integration on an unrecognized value
+because answering a question is judged low-risk there. A notification
+provider is the opposite case: an unrecognized/misconfigured value
+accidentally routing to something that sends a real message would be
+actively unsafe, so this fails safe *toward refusing to send anything at
+all*, never toward the mock and never toward a hypothetical real provider.
+The raw environment variable value is never logged - only whether a sender
+was successfully selected.
+
+### How the mock decides success/failure/exception
+
+The mock reads only `reminder["id"]` - it never inspects `appointment` at
+all, so no appointment/patient content of any kind can ever influence its
+behavior. Two fixed substrings a test can embed in a reminder's `id`
+deterministically request the corresponding outcome:
+
+- id contains `mock_notification_provider.MOCK_FAILURE_MARKER` → returns `False`
+- id contains `mock_notification_provider.MOCK_ERROR_MARKER` → raises `mock_notification_provider.MockNotificationError`
+- any other id (in particular every real reminder id, which is always a
+  UUID from `reminder_service.create_reminder()`) → returns `True`
+
+This was a deliberate, explicit design choice, not an invented default: no
+`channel` field was added (see the Phase 6.2-C decision above, unchanged),
+no contact/destination field was added, and the `send()` signature could
+not be extended with a new test-only parameter without changing the
+contract `reminder_service.py` itself defines - encoding the desired
+outcome in the reminder's own `id`, the one piece of data both the mock and
+its caller already share, needed no schema change and no new parameter.
+Ordinary CLI/demo usage - where reminder ids are always real UUIDs - is
+therefore unambiguous, always-succeeds behavior; only a test that
+deliberately constructs a marked id sees the other two outcomes.
+
+### CLI outcome semantics - unchanged exit-code mapping
+
+`run_due_reminders.py` still owns no reminder domain logic. When a sender
+is configured, `_run_mutating()` calls the real
+`reminder_service.process_due_reminders(send=sender)` and:
+
+- a completed run - including individual reminders that ended up `failed`
+  or `cancelled` - is `EXIT_OK`. Those are already correctly-modeled
+  outcomes inside `reminder_service.py` (a `sent`/`failed`/`cancelled`
+  state transition is the feature working as designed, not a process
+  failure), and the CLI does not re-interpret or duplicate that logic.
+- `ReminderDataError` (malformed reminder data) → `EXIT_MALFORMED_DATA`,
+  exactly mirroring `_run_dry_run()`'s own exception handling.
+- any other exception from `process_due_reminders()` itself (not from
+  `send()`, which `process_due_reminders()` already catches and isolates
+  per reminder - see the Phase 6.2-C section above) → `EXIT_RUNTIME_FAILURE`.
+
+No new exit code was introduced. `EXIT_NO_SENDER_CONFIGURED` still means
+exactly what it meant in Phase 6.2-D: no sender could be selected at all.
+
+### What this slice deliberately does NOT add
+
+- **No message-template/notification-content service.** The mock does not
+  render, generate, or log anything resembling a patient-facing message -
+  it only decides `True`/`False`/raise from a reminder id. A deterministic
+  message-rendering layer remains a separate, later slice (see the Phase
+  6.2-C "message generation" decision above, still unbuilt).
+- **No LLM-generated notification content, ever** - unchanged, hard
+  boundary, restated here for emphasis since this slice is the first one
+  that actually *sends* (in mock form) anything at all.
+- **No contact/destination data anywhere** - the mock never requires, reads,
+  or exposes one; `appointment` is accepted only to match the existing
+  `send()` signature and is never inspected.
+- **No `channel` field** - still exactly one reminder type, still exactly
+  one (mock) sender; the decision in the Phase 6.2-C section above is
+  unchanged.
+- **No real provider, no notification SDK, no new dependency.**
+  `backend/requirements.txt` is untouched by this slice - the mock needs
+  nothing beyond the Python standard library.
+- **No retry policy, no locking, no scheduler/cron integration.** All
+  remain exactly as deferred as in every prior phase.
+
+### Idempotency - unchanged guarantees, now with a concrete candidate key
+
+This slice does not change the idempotency analysis from the Phase 6.2-C
+section above: the current JSON-file architecture still only provides
+at-least-once (not exactly-once) delivery at the record level, and that
+remains true with the mock plugged in too - the mock's own outcome is
+irrelevant to that guarantee, which is entirely a property of
+`process_due_reminders()`'s one-write-per-reminder persistence. `reminder.id`
+remains the recommended future provider-side idempotency key (unchanged
+from Phase 6.2-C's own recommendation) - the mock does not use it as one
+today (it has no provider-side state to deduplicate against), since doing
+so would be simulating a capability no real provider has been chosen yet
+to validate. Exactly-once delivery is still not claimed anywhere in this
+project. JSON-storage concurrency limitations (no file locking, "exactly
+one invocation at a time" remains an external invariant) are unchanged by
+this slice.
+
+### Testing
+
+`backend/tests/test_mock_notification_provider.py` tests the mock in
+isolation: deterministic success/False/exception by marker, no mutation of
+either argument, no dependence on `appointment` content, and no
+network/notification-SDK dependency in its own source.
+
+`backend/tests/test_run_due_reminders.py` adds, alongside its existing
+CLI-boundary-only tests (which continue to mock `reminder_service`):
+provider-selection tests (unset/unknown/`mock`, still with
+`process_due_reminders()` mocked, since those are only about *whether* and
+*how* it's called); a dry-run isolation test proving `--dry-run` invokes
+neither `process_due_reminders()` nor the mock's own `send()` even when
+`NOTIFICATION_PROVIDER=mock` is set; and `MockProviderEndToEndTest`, which
+deliberately does **not** mock `process_due_reminders()` - it redirects
+`reminder_service.REMINDERS_FILE`/`APPOINTMENTS_FILE` to a temp directory
+(the same isolation pattern `test_reminder_service.py`'s own
+`ReminderIntegrationTestCase` already established) and runs the real
+processor against the real mock provider, proving success/False/exception
+outcomes, independent processing of multiple reminders, and that an
+already-terminal reminder is left untouched - plus a direct checksum-style
+comparison proving the real repository's `backend/reminders.json` and
+`backend/appointments.json` are never read or written by any test in that
+class.

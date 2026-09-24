@@ -1,18 +1,32 @@
-"""Tests for backend/run_due_reminders.py (Phase 6.2-D).
+"""Tests for backend/run_due_reminders.py (Phase 6.2-D/E).
 
-Every test calls main(argv) directly, in-process - never a real
-subprocess - and mocks/patches backend.run_due_reminders.reminder_service
+Most tests call main(argv) directly, in-process - never a real
+subprocess - and mock/patch backend.run_due_reminders.reminder_service
 so nothing here ever touches a real or even a temp reminders.json/
 appointments.json. This module owns no domain logic of its own (see its
-own docstring), so these tests are only about the CLI boundary itself:
-argument parsing, dispatch, exit codes, and logged content - never
-reminder eligibility/state-transition behavior, which is already fully
-covered by backend/tests/test_reminder_service.py.
+own docstring), so most of these tests are only about the CLI boundary
+itself: argument parsing, dispatch, exit codes, and logged content -
+never reminder eligibility/state-transition behavior, which is already
+fully covered by backend/tests/test_reminder_service.py.
+
+Phase 6.2-E adds one exception to that "always mock reminder_service"
+rule: MockProviderEndToEndTest below deliberately does NOT mock
+reminder_service.process_due_reminders() - it redirects
+reminder_service.REMINDERS_FILE/APPOINTMENTS_FILE to a temp directory
+(the same isolation pattern backend/tests/test_reminder_service.py's own
+ReminderIntegrationTestCase already uses) and lets the REAL processor run
+against backend.mock_notification_provider, to prove the whole pipeline
+- CLI -> real process_due_reminders() -> mock send() -> persisted
+reminders.json - actually works end-to-end, not just that the CLI calls
+the right mocked function.
 """
+import json
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from backend import run_due_reminders
+from backend import mock_notification_provider, reminder_service, run_due_reminders
 
 
 def make_reminder(reminder_id="r1", appointment_id="a1"):
@@ -100,12 +114,20 @@ class DryRunTest(unittest.TestCase):
 
 
 class MutatingModeTest(unittest.TestCase):
+    """NOTIFICATION_PROVIDER is explicitly pinned to "" (unset-equivalent,
+    see ProviderSelectionTest below for the full selection-logic coverage)
+    in every test here, so these tests are deterministic regardless of
+    whatever NOTIFICATION_PROVIDER happens to be set to in the real shell
+    environment running the test suite.
+    """
+
     @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
     @patch.object(run_due_reminders.reminder_service, "get_due_reminders")
     def test_normal_invocation_with_no_sender_exits_non_zero_and_mutates_nothing(
         self, mock_get_due, mock_process
     ):
-        exit_code = run_due_reminders.main([])
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": ""}):
+            exit_code = run_due_reminders.main([])
 
         self.assertNotEqual(exit_code, 0)
         self.assertEqual(exit_code, run_due_reminders.EXIT_NO_SENDER_CONFIGURED)
@@ -117,10 +139,11 @@ class MutatingModeTest(unittest.TestCase):
 
     @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
     def test_normal_invocation_logs_safely(self, mock_process):
-        with self.assertLogs(run_due_reminders.logger, level="ERROR") as captured:
-            run_due_reminders.main([])
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": ""}):
+            with self.assertLogs(run_due_reminders.logger, level="ERROR") as captured:
+                run_due_reminders.main([])
 
-        self.assertTrue(any("no notification sender" in line.lower() for line in captured.output))
+        self.assertTrue(any("no notification provider" in line.lower() for line in captured.output))
         mock_process.assert_not_called()
 
 
@@ -131,7 +154,9 @@ class ArgvHandlingTest(unittest.TestCase):
         # argv, argparse falls back to sys.argv[1:] - under the test
         # runner that is empty/irrelevant flags, so this exercises the
         # same "normal invocation, no sender" path deterministically.
-        with patch("sys.argv", ["run_due_reminders"]):
+        # NOTIFICATION_PROVIDER is pinned to "" so this is deterministic
+        # regardless of the real shell environment running the suite.
+        with patch("sys.argv", ["run_due_reminders"]), patch.dict("os.environ", {"NOTIFICATION_PROVIDER": ""}):
             exit_code = run_due_reminders.main(None)
 
         self.assertEqual(exit_code, run_due_reminders.EXIT_NO_SENDER_CONFIGURED)
@@ -169,6 +194,230 @@ class OutputSafetyTest(unittest.TestCase):
         full_output = "\n".join(captured.output)
         for forbidden in self._FORBIDDEN_SUBSTRINGS:
             self.assertNotIn(forbidden, full_output)
+
+
+class ProviderSelectionTest(unittest.TestCase):
+    """NOTIFICATION_PROVIDER selection at the CLI boundary - still with
+    reminder_service.process_due_reminders() mocked, since these tests are
+    only about whether it gets CALLED (and with what), not about the real
+    state-transition pipeline (that's MockProviderEndToEndTest below).
+    """
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    def test_no_provider_configured_exits_no_sender_configured(self, mock_process):
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": ""}):
+            exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_NO_SENDER_CONFIGURED)
+        mock_process.assert_not_called()
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    def test_unknown_provider_value_exits_no_sender_configured_not_mock(self, mock_process):
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "sendgrid"}):
+            exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_NO_SENDER_CONFIGURED)
+        mock_process.assert_not_called()
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders", return_value=[])
+    def test_notification_provider_mock_invokes_real_process_due_reminders_with_mock_send(
+        self, mock_process
+    ):
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "mock"}):
+            exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        mock_process.assert_called_once_with(send=mock_notification_provider.send)
+
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    def test_notification_provider_mock_is_case_insensitive_and_trims_whitespace(self, mock_process):
+        mock_process.return_value = []
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "  MOCK  "}):
+            exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        mock_process.assert_called_once_with(send=mock_notification_provider.send)
+
+
+class DryRunProviderIsolationTest(unittest.TestCase):
+    """Proves --dry-run stays completely non-mutating even when a
+    provider IS configured - it must never reach process_due_reminders()
+    or the mock provider's own send() at all.
+    """
+
+    @patch.object(run_due_reminders.mock_notification_provider, "send")
+    @patch.object(run_due_reminders.reminder_service, "process_due_reminders")
+    @patch.object(run_due_reminders.reminder_service, "get_due_reminders", return_value=[])
+    def test_dry_run_never_invokes_process_due_reminders_or_mock_send_when_configured(
+        self, mock_get_due, mock_process, mock_send
+    ):
+        with patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "mock"}):
+            exit_code = run_due_reminders.main(["--dry-run"])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        mock_get_due.assert_called_once_with()
+        mock_process.assert_not_called()
+        mock_send.assert_not_called()
+
+
+def make_due_reminder(reminder_id, appointment_id="a1"):
+    """A `pending` reminder whose sendAt is far in the past - always due,
+    regardless of the real wall-clock time the test happens to run at.
+    """
+    return {
+        "id": reminder_id,
+        "appointmentId": appointment_id,
+        "type": "24h_before",
+        "sendAt": "2020-01-01T00:00:00+00:00",
+        "status": "pending",
+        "createdAt": "2019-12-01T00:00:00+00:00",
+        "sentAt": None,
+        "failureReason": None,
+    }
+
+
+def make_active_appointment(appointment_id="a1"):
+    return {
+        "id": appointment_id,
+        "name": "Test Patient",
+        "date": "2099-01-01",
+        "time": "10:00",
+        "providerId": "p1",
+        "durationMinutes": 30,
+    }
+
+
+class MockProviderEndToEndTest(unittest.TestCase):
+    """Exercises the REAL pipeline: main() -> the REAL
+    reminder_service.process_due_reminders() -> mock_notification_provider.send()
+    -> persisted (temp-file) reminders.json. process_due_reminders() is
+    never mocked in this class - only reminder_service.REMINDERS_FILE/
+    APPOINTMENTS_FILE are redirected to a temp directory, matching the
+    isolation pattern backend/tests/test_reminder_service.py's own
+    ReminderIntegrationTestCase already uses. The real repository's
+    backend/reminders.json and backend/appointments.json are never read
+    or written by any test in this class (see
+    test_real_repository_data_files_are_not_modified below, which proves
+    it directly rather than assuming it).
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.reminders_file = os.path.join(self.tmp_dir.name, "reminders.json")
+        self.appointments_file = os.path.join(self.tmp_dir.name, "appointments.json")
+
+        patchers = [
+            patch.object(reminder_service, "REMINDERS_FILE", self.reminders_file),
+            patch.object(reminder_service, "APPOINTMENTS_FILE", self.appointments_file),
+            patch.dict("os.environ", {"NOTIFICATION_PROVIDER": "mock"}),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _write(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _read(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def test_mock_success_marks_reminder_sent_with_sent_at(self):
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [make_due_reminder("r-ok", "a1")])
+
+        exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = self._read(self.reminders_file)
+        self.assertEqual(reminders[0]["status"], "sent")
+        self.assertIsNotNone(reminders[0]["sentAt"])
+        self.assertIsNone(reminders[0]["failureReason"])
+
+    def test_mock_false_marks_reminder_failed_send_failed(self):
+        failing_id = f"r-fail{mock_notification_provider.MOCK_FAILURE_MARKER}"
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [make_due_reminder(failing_id, "a1")])
+
+        exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = self._read(self.reminders_file)
+        self.assertEqual(reminders[0]["status"], "failed")
+        self.assertEqual(reminders[0]["failureReason"], "send_failed")
+
+    def test_mock_exception_marks_reminder_failed_send_failed_without_crashing(self):
+        erroring_id = f"r-err{mock_notification_provider.MOCK_ERROR_MARKER}"
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [make_due_reminder(erroring_id, "a1")])
+
+        exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = self._read(self.reminders_file)
+        self.assertEqual(reminders[0]["status"], "failed")
+        self.assertEqual(reminders[0]["failureReason"], "send_failed")
+
+    def test_multiple_reminders_processed_independently(self):
+        ok_id = "r-ok"
+        fail_id = f"r-fail{mock_notification_provider.MOCK_FAILURE_MARKER}"
+        error_id = f"r-err{mock_notification_provider.MOCK_ERROR_MARKER}"
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(
+            self.reminders_file,
+            [
+                make_due_reminder(ok_id, "a1"),
+                make_due_reminder(fail_id, "a1"),
+                make_due_reminder(error_id, "a1"),
+            ],
+        )
+
+        exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = {r["id"]: r for r in self._read(self.reminders_file)}
+        self.assertEqual(reminders[ok_id]["status"], "sent")
+        self.assertEqual(reminders[fail_id]["status"], "failed")
+        self.assertEqual(reminders[fail_id]["failureReason"], "send_failed")
+        self.assertEqual(reminders[error_id]["status"], "failed")
+        self.assertEqual(reminders[error_id]["failureReason"], "send_failed")
+
+    def test_terminal_reminder_is_not_reprocessed(self):
+        already_sent = make_due_reminder("r-sent", "a1")
+        already_sent["status"] = "sent"
+        already_sent["sentAt"] = "2020-01-01T00:00:00+00:00"
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [already_sent])
+
+        exit_code = run_due_reminders.main([])
+
+        self.assertEqual(exit_code, run_due_reminders.EXIT_OK)
+        reminders = self._read(self.reminders_file)
+        self.assertEqual(reminders[0]["status"], "sent")
+        self.assertEqual(reminders[0]["sentAt"], "2020-01-01T00:00:00+00:00")
+
+    def test_real_repository_data_files_are_not_modified(self):
+        real_reminders_path = os.path.join(os.path.dirname(reminder_service.__file__), "reminders.json")
+        real_appointments_path = os.path.join(
+            os.path.dirname(reminder_service.__file__), "appointments.json"
+        )
+        with open(real_reminders_path) as f:
+            before_reminders = f.read()
+        with open(real_appointments_path) as f:
+            before_appointments = f.read()
+
+        self._write(self.appointments_file, [make_active_appointment("a1")])
+        self._write(self.reminders_file, [make_due_reminder("r-ok", "a1")])
+        run_due_reminders.main([])
+
+        with open(real_reminders_path) as f:
+            after_reminders = f.read()
+        with open(real_appointments_path) as f:
+            after_appointments = f.read()
+        self.assertEqual(before_reminders, after_reminders)
+        self.assertEqual(before_appointments, after_appointments)
 
 
 if __name__ == "__main__":
