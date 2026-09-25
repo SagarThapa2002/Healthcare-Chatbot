@@ -26,6 +26,22 @@ class WebhookTestCase(unittest.TestCase):
     to route to the cancellation/update confirm handlers, so leaving
     either unpatched would have that check silently hit the real repo
     path instead of this isolated one.
+
+    reminder_service.REMINDERS_FILE is also patched (Phase 6.2-H
+    isolation fix): since Phase 6.2-H, a successful booking confirmation
+    calls chatbot_logic._schedule_reminder_for_booking(), which in turn
+    calls the real reminder_service.create_reminder() - so a booking test
+    in this class can now reach reminder creation too, not just
+    appointment persistence. Whether that succeeds (a valid
+    CLINIC_TIMEZONE is configured) or fails closed (ReminderConfigError,
+    caught by _schedule_reminder_for_booking and merely logged - see its
+    own docstring), this patch guarantees any write lands in this test's
+    own temp file, never the real backend/reminders.json - regardless of
+    whatever CLINIC_TIMEZONE happens to be set to in the environment
+    actually running this suite. See
+    test_booking_flow_never_touches_the_real_reminders_file below for a
+    direct proof of this, with CLINIC_TIMEZONE deliberately configured so
+    reminder creation actually succeeds rather than failing closed.
     """
 
     def setUp(self):
@@ -36,6 +52,7 @@ class WebhookTestCase(unittest.TestCase):
         self.pending_file = os.path.join(self.tmp_dir.name, 'pending_appointments.json')
         self.pending_cancellation_file = os.path.join(self.tmp_dir.name, 'pending_cancellation.json')
         self.pending_update_file = os.path.join(self.tmp_dir.name, 'pending_update.json')
+        self.reminders_file = os.path.join(self.tmp_dir.name, 'reminders.json')
 
         patcher_appointments = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
         patcher_pending = patch.object(chatbot_logic, 'PENDING_FILE', self.pending_file)
@@ -48,16 +65,19 @@ class WebhookTestCase(unittest.TestCase):
         patcher_availability_appointments = patch.object(
             availability_service, 'APPOINTMENTS_FILE', self.appointments_file
         )
+        patcher_reminders = patch.object(reminder_service, 'REMINDERS_FILE', self.reminders_file)
         patcher_appointments.start()
         patcher_pending.start()
         patcher_pending_cancellation.start()
         patcher_pending_update.start()
         patcher_availability_appointments.start()
+        patcher_reminders.start()
         self.addCleanup(patcher_appointments.stop)
         self.addCleanup(patcher_pending.stop)
         self.addCleanup(patcher_pending_cancellation.stop)
         self.addCleanup(patcher_pending_update.stop)
         self.addCleanup(patcher_availability_appointments.stop)
+        self.addCleanup(patcher_reminders.stop)
 
         self.client = app.test_client()
 
@@ -139,6 +159,46 @@ class WebhookTestCase(unittest.TestCase):
 
         # The booking was written to the temp file, never the real one.
         self.assertTrue(os.path.exists(self.appointments_file))
+
+    def test_booking_flow_never_touches_the_real_reminders_file(self):
+        # Phase 6.2-H isolation fix regression test. CLINIC_TIMEZONE is
+        # deliberately configured here (unlike every other test in this
+        # class, which relies on whatever - if anything - happens to be
+        # set in the real environment) so that
+        # chatbot_logic._schedule_reminder_for_booking()'s
+        # reminder_service.create_reminder() call actually succeeds and
+        # writes a reminder, rather than failing closed with
+        # ReminderConfigError - the strongest available proof that the
+        # write lands in this test's own temp reminders_file (see
+        # WebhookTestCase.setUp's own docstring), never the real
+        # backend/reminders.json, regardless of configuration.
+        real_reminders_path = os.path.join(os.path.dirname(reminder_service.__file__), 'reminders.json')
+        with open(real_reminders_path) as f:
+            before = f.read()
+
+        with patch.dict('os.environ', {'CLINIC_TIMEZONE': 'Europe/London'}):
+            self.post_webhook("Book Appointment", {"name": "Test Patient"})
+            self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": "dr-patel"})
+            self.post_webhook(
+                "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+            )
+            self.post_webhook(
+                "Book Appointment",
+                {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+            )
+            self.post_webhook("YesIntent")
+
+        # Confirms reminder creation genuinely ran (and succeeded) in
+        # this test - never silently skipped for an unrelated reason -
+        # and that it landed in the temp file, not the real one.
+        with open(self.reminders_file) as f:
+            temp_reminders = json.load(f)
+        self.assertEqual(len(temp_reminders), 1)
+        self.assertEqual(temp_reminders[0]["status"], "pending")
+
+        with open(real_reminders_path) as f:
+            after = f.read()
+        self.assertEqual(before, after)
 
     def test_yes_intent_without_pending_booking_stays_a_text_message(self):
         data = self.post_webhook("YesIntent").get_json()

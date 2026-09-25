@@ -638,6 +638,7 @@ def _handle_yes_intent():
         appointment['id'] = str(uuid.uuid4())
         appointments.append(appointment)
         _save_appointments(appointments)
+        _schedule_reminder_for_booking(appointment)
         os.remove(PENDING_FILE)
 
         text = f"Your appointment for {appointment['name']} on {appointment['date']} at {appointment['time']} has been booked."
@@ -645,6 +646,43 @@ def _handle_yes_intent():
 
     text = "There is no appointment pending confirmation."
     return [response_model.text_message(text)], None
+
+
+def _schedule_reminder_for_booking(appointment):
+    """Phase 6.2-H: creates a pending 24h_before reminder for a newly
+    booked `appointment`, if eligible (backend/reminder_service.py).
+    Called only from _handle_yes_intent above, immediately after the new
+    appointment has actually been persisted via _save_appointments -
+    mirrors _reschedule_reminders'/_cancel_reminders' own placement
+    (immediately after their own _save_appointments call) exactly.
+
+    Before this slice, reminder_service.create_reminder() was wired in
+    only at the update/cancel hooks - a newly booked appointment that was
+    never later rescheduled received no reminder at all. This hook closes
+    that gap; it introduces no new reminder domain logic of its own -
+    eligibility (active status, valid date/time, at least 24h away, a
+    valid CLINIC_TIMEZONE) remains entirely owned by
+    reminder_service.is_eligible_for_reminder()/create_reminder(), which
+    already silently no-ops for an ineligible appointment.
+
+    Reminders are an additive, best-effort foundation with no delivery
+    channel wired to them yet (see backend/REMINDER_NOTES.md) - a
+    reminder-scheduling problem (most likely a missing/invalid
+    CLINIC_TIMEZONE - reminder_config.ReminderConfigError) must never
+    prevent the booking confirmation itself from succeeding, so any
+    exception here is caught and only its type is logged (never its text
+    or any appointment content - see backend/LOGGING_NOTES.md), never
+    re-raised. This is the exact same resilience pattern already used by
+    _reschedule_reminders/_cancel_reminders, applied here for the same
+    reason: the appointment mutation (Phase 6.1's hardened, load-bearing
+    feature) must never be blocked or altered by the reminder subsystem.
+    """
+    try:
+        reminder_service.create_reminder(appointment, reminder_service.REMINDER_TYPE_24H_BEFORE)
+    except Exception as e:
+        logger.warning(
+            "reminder scheduling skipped after booking - exception_type=%s", type(e).__name__
+        )
 
 
 def _handle_no_intent():

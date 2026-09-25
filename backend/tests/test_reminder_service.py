@@ -1,6 +1,7 @@
 """Tests for backend/reminder_service.py (Phase 6.2-A and 6.2-B), plus
-integration tests proving chatbot_logic.py's two reminder hooks
-(_reschedule_reminders / _cancel_reminders) are actually wired up.
+integration tests proving chatbot_logic.py's three reminder hooks
+(_schedule_reminder_for_booking / _reschedule_reminders / _cancel_reminders)
+are actually wired up.
 
 Every test isolates reminders.json (and, for the integration classes,
 appointments.json and the three pending-transaction files) to a temp
@@ -624,12 +625,12 @@ class MalformedReminderRecordTest(ReminderServiceTestCase):
 
 
 class ReminderIntegrationTestCase(unittest.TestCase):
-    """Full webhook-level tests proving chatbot_logic.py's two reminder
-    integration hooks (_reschedule_reminders / _cancel_reminders) are
-    actually wired up correctly - not just that reminder_service.py's own
-    functions work in isolation. Self-contained (no cross-class
-    inheritance), matching this project's established pattern for
-    avoiding unittest's inherited-test-duplication risk.
+    """Full webhook-level tests proving chatbot_logic.py's three reminder
+    integration hooks (_schedule_reminder_for_booking / _reschedule_reminders /
+    _cancel_reminders) are actually wired up correctly - not just that
+    reminder_service.py's own functions work in isolation. Self-contained
+    (no cross-class inheritance), matching this project's established
+    pattern for avoiding unittest's inherited-test-duplication risk.
     """
 
     def setUp(self):
@@ -678,14 +679,79 @@ class ReminderIntegrationTestCase(unittest.TestCase):
         with open(self.appointments_file, 'r') as f:
             return json.load(f)
 
-    def test_booking_alone_never_creates_a_reminder(self):
-        # Reminders are only touched at the two documented hook points
-        # (cancel/update confirm) - booking itself must not create one.
-        self._book_and_confirm()
+    def test_eligible_booking_creates_exactly_one_pending_24h_before_reminder(self):
+        # Phase 6.2-H: booking itself now creates a reminder for an
+        # eligible (active, far-enough-future) appointment - reversing
+        # the old test_booking_alone_never_creates_a_reminder assumption,
+        # which is no longer this project's intended behavior.
+        appointment = self._book_and_confirm(date="2026-12-28", time="10:00")
+
+        self.assertTrue(appointment.get("id"))
+        reminders = self._read_reminders()
+        self.assertEqual(len(reminders), 1)
+        reminder = reminders[0]
+        self.assertEqual(reminder["status"], "pending")
+        self.assertEqual(reminder["type"], "24h_before")
+        self.assertEqual(reminder["appointmentId"], appointment["id"])
+        expected_send_at = reminder_service.compute_send_at(appointment)
+        self.assertEqual(datetime.fromisoformat(reminder["sendAt"]), expected_send_at)
+
+    def test_ineligible_booking_less_than_24h_away_creates_no_reminder(self):
+        # reminder_service treats "less than 24h away" and "already past"
+        # as the SAME eligibility condition (sendAt <= now - see
+        # REMINDER_NOTES.md's "Two distinct inequalities" section) - a
+        # fixed past date is used here rather than a live wall-clock-
+        # relative time, since dr-patel's fixed weekly availability
+        # (Monday/Wednesday only, backend/provider_availability.json)
+        # makes constructing a real, bookable "<24h from whenever this
+        # suite happens to run" slot unreliable (a test run on a Friday
+        # afternoon through Sunday would find no such slot at all).
+        # 2020-01-01 is a Wednesday - a valid, always-bookable slot day -
+        # and is unambiguously both "less than 24h away" and "in the
+        # past" by the time this test runs.
+        appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
+
+        self.assertTrue(appointment.get("id"))
+        self.assertEqual(self._read_reminders(), [])
+
+    def test_missing_clinic_timezone_does_not_break_booking(self):
+        with patch.dict('os.environ', {}, clear=True):
+            self.post_webhook(
+                "Book Appointment",
+                {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
+            )
+            confirmed = self.post_webhook("YesIntent").get_json()
+
+        self.assertTrue(confirmed["success"])
+        message = confirmed["messages"][0]
+        self.assertEqual(message["type"], "booking_confirmation")
+        # Response shape unchanged by Phase 6.2-H: still exactly text +
+        # appointment, no reminder-related text/field/metadata added.
+        self.assertEqual(set(message["content"].keys()), {"text", "appointment"})
+        self.assertIn("has been booked", message["content"]["text"])
+
+        appointment = message["content"]["appointment"]
+        saved_appointments = self._read_appointments()
+        self.assertEqual(len(saved_appointments), 1)
+        self.assertEqual(saved_appointments[0]["id"], appointment["id"])
+
+        # Pending-booking cleanup still occurred despite the reminder-
+        # scheduling failure (missing CLINIC_TIMEZONE).
+        self.assertFalse(os.path.exists(self.pending_file))
+
+        # Reminder creation failed silently (ReminderConfigError, caught
+        # and logged by _schedule_reminder_for_booking) - no reminder was
+        # created, but nothing above was affected by that failure.
         self.assertEqual(self._read_reminders(), [])
 
     def test_cancellation_with_nothing_pending_does_not_error(self):
-        appointment = self._book_and_confirm()
+        # A past-dated appointment is not reminder-eligible (see
+        # reminder_service.is_eligible_for_reminder), so booking one
+        # leaves nothing pending - exercising cancel_pending_reminder's
+        # own documented safe no-op for that case.
+        appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
+        self.assertEqual(self._read_reminders(), [])
+
         self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
         confirmed = self.post_webhook("YesIntent").get_json()
         self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
@@ -693,9 +759,12 @@ class ReminderIntegrationTestCase(unittest.TestCase):
 
     def test_cancellation_transitions_an_existing_pending_reminder(self):
         appointment = self._book_and_confirm(date="2026-12-28", time="10:00")
-        reminder_service.create_reminder(
-            appointment, now=datetime(2026, 12, 1, tzinfo=timezone.utc), path=self.reminders_file
-        )
+        # Booking itself already created the pending reminder (Phase
+        # 6.2-H) - a further manual create_reminder() call is unnecessary
+        # (and would itself be a silent no-op, per create_reminder()'s own
+        # idempotency rule: at most one pending reminder per
+        # (appointmentId, type)).
+        self.assertEqual(len(self._read_reminders()), 1)
 
         self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
         self.post_webhook("YesIntent")
@@ -706,9 +775,10 @@ class ReminderIntegrationTestCase(unittest.TestCase):
 
     def test_reschedule_cancels_old_pending_and_creates_new(self):
         appointment = self._book_and_confirm(date="2026-12-28", time="10:00")
-        created = reminder_service.create_reminder(
-            appointment, now=datetime(2026, 12, 1, tzinfo=timezone.utc), path=self.reminders_file
-        )
+        # Booking itself already created the pending reminder (Phase 6.2-H).
+        before = self._read_reminders()
+        self.assertEqual(len(before), 1)
+        created_id = before[0]["id"]
 
         self.post_webhook("Update Appointment", {"id": appointment["id"], "date": "2026-12-30"})
         confirmed = self.post_webhook("YesIntent").get_json()
@@ -716,18 +786,18 @@ class ReminderIntegrationTestCase(unittest.TestCase):
 
         saved = self._read_reminders()
         self.assertEqual(len(saved), 2)
-        old = next(r for r in saved if r["id"] == created["id"])
+        old = next(r for r in saved if r["id"] == created_id)
         self.assertEqual(old["status"], "cancelled")
-        new = next(r for r in saved if r["id"] != created["id"])
+        new = next(r for r in saved if r["id"] != created_id)
         self.assertEqual(new["status"], "pending")
         self.assertNotEqual(new["sendAt"], old["sendAt"])
 
     def test_reschedule_after_sent_creates_a_new_reminder_and_preserves_history(self):
         appointment = self._book_and_confirm(date="2026-12-28", time="10:00")
-        created = reminder_service.create_reminder(
-            appointment, now=datetime(2026, 12, 1, tzinfo=timezone.utc), path=self.reminders_file
-        )
+        # Booking itself already created the pending reminder (Phase 6.2-H).
         saved = self._read_reminders()
+        self.assertEqual(len(saved), 1)
+        created_id = saved[0]["id"]
         saved[0]["status"] = "sent"
         saved[0]["sentAt"] = "2026-12-27T10:00:00+00:00"
         with open(self.reminders_file, 'w') as f:
@@ -738,9 +808,9 @@ class ReminderIntegrationTestCase(unittest.TestCase):
 
         saved_after = self._read_reminders()
         self.assertEqual(len(saved_after), 2)
-        original_after = next(r for r in saved_after if r["id"] == created["id"])
+        original_after = next(r for r in saved_after if r["id"] == created_id)
         self.assertEqual(original_after["status"], "sent")
-        new = next(r for r in saved_after if r["id"] != created["id"])
+        new = next(r for r in saved_after if r["id"] != created_id)
         self.assertEqual(new["status"], "pending")
 
     def test_missing_clinic_timezone_does_not_break_cancellation(self):
@@ -754,14 +824,23 @@ class ReminderIntegrationTestCase(unittest.TestCase):
 
     def test_missing_clinic_timezone_does_not_break_update(self):
         appointment = self._book_and_confirm()
+        # Booking itself already created one pending reminder (Phase 6.2-H),
+        # while CLINIC_TIMEZONE was still configured.
+        self.assertEqual(len(self._read_reminders()), 1)
+
         with patch.dict('os.environ', {}, clear=True):
             self.post_webhook("Update Appointment", {"id": appointment["id"], "date": "2026-12-30"})
             confirmed = self.post_webhook("YesIntent").get_json()
         self.assertIn("has been updated", confirmed["messages"][0]["content"]["text"])
-        # No reminder could be created without a configured timezone -
-        # this must be silent (a logged warning, not a user-visible
-        # error) and must not leave a corrupt/partial reminders.json.
-        self.assertEqual(self._read_reminders(), [])
+        # The old pending reminder was still cancelled (cancellation needs
+        # no timezone), but a new one could not be created without a
+        # configured CLINIC_TIMEZONE - this must be silent (a logged
+        # warning, not a user-visible error), leaving exactly the one,
+        # now-cancelled record behind rather than a corrupt/partial
+        # reminders.json or a wrongly-created second one.
+        saved = self._read_reminders()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["status"], "cancelled")
 
 
 if __name__ == '__main__':
