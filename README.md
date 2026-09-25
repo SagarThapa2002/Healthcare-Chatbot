@@ -72,3 +72,59 @@ cd healthcare-chatbot/backend
 pip install -r requirements.txt
 python app.py
 ngrok http 5000
+```
+
+---
+
+## 🔔 Appointment Reminders
+
+The backend includes a deterministic appointment-reminder subsystem (Phase 6.2). It is functional but **not automatic** and **not connected to any real notification provider** - see the limitations below before assuming this sends real reminders to anyone.
+
+### What creates and updates reminders
+
+- **A successful new booking** can create one pending `24h_before` reminder for that appointment, if it is eligible (see below).
+- **A date/time-changing appointment update** cancels the appointment's old pending reminder (if any) and creates a fresh one for the new date/time, if eligible.
+- **An appointment cancellation** cancels its pending reminder. Reminders are never deleted, only transitioned to a terminal status (`cancelled`), preserving history.
+
+A reminder's `sendAt` is calculated from the appointment's **clinic-local** date/time, then converted and stored as **UTC**. The clinic's timezone is configured via the `CLINIC_TIMEZONE` environment variable (an IANA name, e.g. `Europe/London`) - there is no default, and reminder scheduling fails safely (without affecting the appointment itself) if it is missing or invalid.
+
+**Legacy appointments without a stable id are not eligible for a reminder** - a reminder needs a stable foreign key to reference, and older records (predating appointment ids) have none.
+
+### Processing due reminders (manual only)
+
+Due reminders are **not** processed automatically. Processing them requires manually running:
+
+```bash
+python -m backend.run_due_reminders
+```
+
+- `--dry-run` performs a read-only check of how many reminders are currently due, without processing or mutating anything.
+- `--now <ISO-8601 timestamp>` (e.g. `--now 2027-06-02T00:00:00+00:00`) overrides the "current instant" used for due-detection, for deterministic manual testing or demonstration.
+
+### Notification delivery
+
+The only notification provider currently available is a deterministic, local **mock** provider, selected by setting:
+
+```bash
+NOTIFICATION_PROVIDER=mock
+```
+
+The mock provider **never sends a real notification of any kind** - no network call, no email, no SMS. It exists solely to exercise and demonstrate the due-reminder processing pipeline end-to-end. Without `NOTIFICATION_PROVIDER=mock` set, the CLI refuses to process reminders at all, rather than doing nothing silently.
+
+### Viewing reminders
+
+```
+GET /webhook/reminders
+```
+
+Returns the current reminder records for development/demo visibility. **This endpoint only reads and reports existing reminder state - it does not process, send, or otherwise act on reminders itself.**
+
+### Current limitations
+
+This subsystem is intentionally scoped and should not be mistaken for a production-ready reminder service:
+
+- **No automatic scheduler or background worker** - nothing invokes `run_due_reminders` on its own; it must be run manually (or by an external trigger you set up yourself).
+- **No real email/SMS/push notification provider** - only the local mock exists.
+- **No retry policy** - a `failed` reminder is a terminal outcome; it is never automatically retried.
+- **At-least-once, not exactly-once, delivery semantics** - if the process crashes after a notification is sent but before that outcome is saved, the next run may attempt to send it again.
+- **No file locking or concurrent-invocation protection** - only one invocation of `run_due_reminders` should run at a time.

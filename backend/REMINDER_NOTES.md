@@ -3,12 +3,15 @@
 ## Current status: standalone domain foundation, WHAT/WHEN only
 
 `backend/reminder_service.py` and `backend/reminder_config.py` implement the
-reminder domain model, eligibility, scheduling, and lifecycle. They are wired
-into the live appointment flow at exactly two points -
-`chatbot_logic._reschedule_reminders()` (called from `_handle_update_confirm_yes`)
-and `chatbot_logic._cancel_reminders()` (called from `_handle_cancel_confirm_yes`)
-- and nowhere else. No other part of booking, update, or cancellation is
-changed by this slice.
+reminder domain model, eligibility, scheduling, and lifecycle. As of Phase
+6.2-H, they are wired into the live appointment flow at exactly three points
+- `chatbot_logic._schedule_reminder_for_booking()` (called from
+`_handle_yes_intent`, on a successful new booking - see the Phase 6.2-H
+section below), `chatbot_logic._reschedule_reminders()` (called from
+`_handle_update_confirm_yes`), and `chatbot_logic._cancel_reminders()`
+(called from `_handle_cancel_confirm_yes`) - and nowhere else. No other part
+of booking, update, or cancellation is changed by any reminder-related
+slice.
 
 This slice is exclusively concerned with **what** reminder should exist and
 **when** it is due. It does **not** send anything: there is no email/SMS
@@ -782,3 +785,121 @@ adds `NowOverrideEndToEndTest`, which - mirroring
 proves a reminder whose `sendAt` is genuinely in the future is left
 `pending` without `--now`, and is actually processed to `sent` by the
 real `process_due_reminders()` once `--now` is set past its `sendAt`.
+
+## Reminder creation on booking (Phase 6.2-H)
+
+Before this slice, `reminder_service.create_reminder()` was wired in only at
+the update and cancellation hooks - a newly booked appointment that was
+never later rescheduled received **no reminder at all**. Phase 6.2-H closes
+that gap by adding a third integration hook,
+`chatbot_logic._schedule_reminder_for_booking()`, called from
+`_handle_yes_intent()` on a successful new booking.
+
+### Sequence
+
+```
+booking confirmation ("YesIntent" with a pending booking on file)
+    -> appointment persisted (a stable id is assigned, _save_appointments())
+    -> reminder creation attempted (_schedule_reminder_for_booking())
+    -> a pending 24h_before reminder is stored, if the new appointment is eligible
+    -> the booking confirmation response is returned as successful,
+       regardless of whether reminder creation succeeded, no-opped, or failed
+```
+
+Reminder creation is **best-effort and additive only** - it never rolls back,
+modifies, or delays the appointment that was already persisted immediately
+before it runs. This mirrors `_reschedule_reminders`'/`_cancel_reminders`'
+own established resilience pattern exactly, applied here for the identical
+reason: the appointment mutation (Phase 6.1's hardened, load-bearing
+feature) must never be blocked or altered by the reminder subsystem.
+
+Eligibility (active appointment, valid date/time, at least 24h away, a
+stable id, a valid `CLINIC_TIMEZONE`) is decided entirely by
+`reminder_service.is_eligible_for_reminder()`/`create_reminder()` -
+unchanged, and not duplicated or re-implemented in
+`_schedule_reminder_for_booking()` itself.
+
+### Isolation and safety behavior
+
+- **Reminder creation failure is caught and logged by type only.** Any
+  exception from `create_reminder()` - most likely
+  `reminder_config.ReminderConfigError` for a missing/invalid
+  `CLINIC_TIMEZONE` - is caught by a broad `except Exception`, and only
+  `type(e).__name__` is logged (never its text or any appointment content -
+  see `backend/LOGGING_NOTES.md`), never re-raised.
+- **An invalid or missing `CLINIC_TIMEZONE` does not prevent appointment
+  persistence.** The appointment is already saved before
+  `_schedule_reminder_for_booking()` is ever called; a reminder-scheduling
+  failure only means no reminder is created for that booking, nothing more.
+- **Booking-related tests isolate `reminders.json` through a temporary
+  path**, exactly like every other reminder-touching test in this project:
+  `backend/tests/test_reminder_service.py`'s `ReminderIntegrationTestCase`
+  patches `reminder_service.REMINDERS_FILE`, and (as of the Phase 6.2-H test-isolation
+  follow-up) `backend/tests/test_webhook.py`'s `WebhookTestCase` does too -
+  since booking can now reach reminder creation, that class's own booking
+  tests would otherwise be able to write to the real
+  `backend/reminders.json` whenever `CLINIC_TIMEZONE` happens to be
+  configured in the environment running the suite.
+- **The real `reminders.json` is protected from test writes** as a result -
+  `WebhookTestCase.test_booking_flow_never_touches_the_real_reminders_file`
+  deliberately configures `CLINIC_TIMEZONE` so reminder creation actually
+  succeeds (rather than failing closed), and directly asserts the real
+  file's content is byte-identical before and after.
+
+## The complete current reminder lifecycle
+
+```
+BOOK / UPDATE (date or time changed) / CANCEL   (chatbot_logic.py)
+    |
+    v
+reminder lifecycle hooks
+    (_schedule_reminder_for_booking / _reschedule_reminders / _cancel_reminders)
+    |
+    v
+reminders.json                          (pending / cancelled, written immediately)
+    |
+    v
+[nothing automatic happens here - see "Current operational limitations" below]
+    |
+    v
+manual due processing                    python -m backend.run_due_reminders
+    (NOTIFICATION_PROVIDER=mock required, or the CLI refuses to run)
+    |
+    v
+mock sender                              backend/mock_notification_provider.py
+    |
+    v
+sent / failed / cancelled                (terminal, persisted immediately)
+```
+
+**Nothing in this codebase automatically invokes the due-reminder processor.**
+`python -m backend.run_due_reminders` must be run manually (by a person, or
+by an external trigger someone sets up themselves) for any `pending`
+reminder to ever be evaluated or sent - see "Current operational
+limitations" below.
+
+## Current operational limitations
+
+These are documented, deliberate architectural boundaries for the current
+phase - not defects, and not claims that anything above is broken:
+
+- **No automatic scheduler or background worker exists.** The trigger
+  mechanism that would invoke `run_due_reminders` periodically remains
+  fully deferred, as it has been since Phase 6.2-A.
+- **No real notification provider exists.** Only the deterministic, local,
+  non-network mock (`backend/mock_notification_provider.py`) can be
+  selected.
+- **No retry policy exists for failed reminders.** `failed` is a terminal
+  status; `get_due_reminders()` only ever returns `pending` reminders, so a
+  `failed` one is never automatically reconsidered.
+- **At-least-once, not exactly-once, delivery semantics** - if the process
+  crashes after a notification is successfully sent but before that outcome
+  is persisted, the reminder is still `pending` on disk and may be sent
+  again on the next run.
+- **No file locking or concurrent-invocation protection exists.**
+  "Exactly one invocation of `run_due_reminders` at a time" remains an
+  external invariant this codebase does not itself enforce.
+- **Legacy appointments without a stable id are excluded from reminders
+  entirely** - `is_eligible_for_reminder()` requires a non-empty id, and
+  this project's own real `appointments.json` currently holds legacy
+  records that predate appointment ids.
