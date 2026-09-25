@@ -201,8 +201,9 @@ def _handle_symptom_check(parameters):
 def _format_provider_list():
     """Deterministic, human-readable numbered list of every known provider.
 
-    Not called from _handle_book_appointment or anywhere else yet - see
-    the module docstring's Step 1 scope note. Reads provider data
+    Called from _handle_book_appointment() as part of the NAME -> PROVIDER
+    -> DATE -> SLOT -> CONFIRM -> BOOKED booking sequence (Phase 6.1,
+    Slice 3, Step 2 - see the module docstring above). Reads provider data
     exclusively through provider_repository.list_providers() (never
     providers.json directly), so this module never duplicates that
     module's file I/O or validation, and never mutates what it returns.
@@ -233,9 +234,10 @@ def _format_slot_list(provider_id, date):
     """Deterministic, human-readable numbered list of a provider's
     available start times on one date.
 
-    Not called from _handle_book_appointment or anywhere else yet - see
-    the module docstring's Step 1 scope note. Delegates entirely to
-    availability_service.get_available_slots(): this function contains no
+    Called from _handle_book_appointment() as part of the NAME -> PROVIDER
+    -> DATE -> SLOT -> CONFIRM -> BOOKED booking sequence (Phase 6.1,
+    Slice 3, Step 2 - see the module docstring above). Delegates entirely
+    to availability_service.get_available_slots(): this function contains no
     slot-generation or conflict-detection logic of its own, and never
     reads appointments.json or provider_availability.json directly or
     mutates either.
@@ -252,13 +254,13 @@ def _format_slot_list(provider_id, date):
     different reasons an empty list can occur (no availability configured
     that weekday, vs. a fully booked day); this formatter deliberately
     does not distinguish between them, since that distinction belongs to
-    the later booking-flow integration step, not to formatting.
+    the caller (_handle_book_appointment), not to formatting.
 
     Raises availability_service.AvailabilityError exactly when
     get_available_slots() would (e.g. an unknown provider_id or a
     malformed date) - not caught or reinterpreted here. Handling that is
-    the responsibility of whatever calls this once it's wired into the
-    booking flow.
+    the responsibility of _handle_book_appointment, which calls this as
+    part of the booking flow.
     """
     slots = availability_service.get_available_slots(provider_id, date)
     if not slots:
@@ -1300,10 +1302,12 @@ def _handle_general_faq(parameters, request_id=None):
     no second classifier is introduced here.
 
     `parameters.get('message')` is the raw user question, if the caller
-    provided one. The current frontend (useConversation.js) does not send
-    this yet for General FAQ - see backend/LLM_ASSISTANT_NOTES.md - so in
-    practice this still always falls back to the deterministic greeting
-    below until that is wired up as a separate, explicit step.
+    provided one. The frontend (useConversation.js) does send this for
+    General FAQ - see backend/LLM_ASSISTANT_NOTES.md. Whether that reaches
+    assistant_service.answer() still depends on llm_config.LLM_ENABLED
+    (off by default, see backend/llm_config.py) and on message_text being
+    present; when either is missing, this always falls back to the
+    deterministic greeting below.
     """
     message_text = (parameters or {}).get('message')
 

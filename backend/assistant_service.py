@@ -7,9 +7,12 @@ claude_provider.py.
         v
     claude_provider.py      <- thin Anthropic API adapter
 
-Not wired into the live chatbot yet: chatbot_logic.py does not import this
-module. LLM_ENABLED defaults to False (backend/llm_config.py), and every
-test in this module's test file works without an API key.
+Wired into the live chatbot: chatbot_logic.py's _handle_general_faq()
+calls assistant_service.answer() for the General FAQ intent whenever a
+message is present (see that function's own docstring). LLM_ENABLED
+(backend/llm_config.py) gates this path and defaults to False, so being
+wired in does not by itself make the assistant active - every test in
+this module's test file works without an API key regardless.
 
 WHAT THIS MODULE IS
 --------------------
@@ -37,8 +40,12 @@ WHAT THIS MODULE IS NOT
   a real, tested constant precisely so this claim can't quietly drift.
 - It does not add conversation history, transcript logging, or retries in
   this phase, and it never makes a real Anthropic API call unless
-  LLM_ENABLED is explicitly set to true AND a request already passed the
-  policy check.
+  LLM_ENABLED is explicitly set to true, a request already passed the
+  policy check, AND claude_provider.py has a configured ANTHROPIC_API_KEY
+  to authenticate with (see llm_config.get_api_key()) - the deterministic
+  mock provider (backend/mock_provider.py, opt-in via LLM_PROVIDER=mock)
+  remains available for exercising this path in local development/tests
+  without either requirement.
 """
 import logging
 import re

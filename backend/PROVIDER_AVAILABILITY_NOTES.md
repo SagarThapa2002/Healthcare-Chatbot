@@ -1,13 +1,19 @@
 # Provider & availability — design notes and current status (Phase 6.1, Slice 1)
 
-## Current status: standalone foundation, NOT wired into the live chatbot
+## Current status: wired into the live booking flow
 
 `backend/provider_repository.py` loads and validates `backend/providers.json`
-and `backend/provider_availability.json`. Nothing in `chatbot_logic.py`,
-`webhook.py`, or the frontend imports or calls this module yet - booking,
-update, cancel, and view behavior are completely unchanged by this slice.
-This is intentionally a small, isolated data foundation for a later slice to
-build the actual booking-flow integration on top of.
+and `backend/provider_availability.json`; `backend/availability_service.py`
+turns that into calculated, conflict-checked slots. Both started as a
+standalone data foundation (Slice 1/2) with no caller, but Slice 3 wired
+them into `chatbot_logic.py`'s booking flow via `_format_provider_list()`
+and `_format_slot_list()`, called from `_handle_book_appointment()`. The
+live booking sequence is now `NAME -> PROVIDER -> DATE -> SLOT -> CONFIRM
+-> BOOKED`. `webhook.py` and the frontend still never import either
+module directly - they only reach it indirectly, through
+`chatbot_logic.py`. Update/cancel/view behavior is unchanged by this
+integration; only new-booking's own sequence gained the PROVIDER/SLOT
+steps.
 
 ## Recurring weekly availability only
 
@@ -81,9 +87,10 @@ swallowed, coerced, or partially accepted) for:
 
 `backend/availability_service.py` builds on the repository above to turn a
 provider's recurring weekly windows into concrete, bookable start times for
-one specific date - still **not** wired into `chatbot_logic.py`, `webhook.py`,
-or the frontend. This slice only adds a standalone computation module; the
-booking conversation flow is completely unchanged.
+one specific date. This slice added it as a standalone computation module
+with no caller yet; Slice 3 (see "Current status" above) later wired it
+into `chatbot_logic.py`'s booking flow. `webhook.py` and the frontend
+still never import it directly.
 
 - **Slots are calculated on demand, not persisted.** `get_available_slots()`
   and `is_slot_available()` recompute their answer from scratch on every
@@ -118,8 +125,8 @@ booking conversation flow is completely unchanged.
 - **Scheduling still uses local clinic time only** - `availability_service.py`
   does no timezone conversion, matching `provider_availability.json`'s own
   scope note above.
-- **This slice does not yet modify the booking conversation.** Nothing in
-  `chatbot_logic.py` calls `availability_service.py` yet; a user booking an
-  appointment today still goes through the exact same flow as before this
-  slice existed. Wiring this into the actual booking flow (and introducing
-  provider selection) is deliberately a later, separate step.
+- **This slice itself did not modify the booking conversation** - that
+  integration (provider selection, calculated slots, and the resulting
+  NAME -> PROVIDER -> DATE -> SLOT -> CONFIRM -> BOOKED sequence) is
+  Phase 6.1, Slice 3, documented in "Current status" above and in
+  `chatbot_logic.py`'s own module docstring.

@@ -6,12 +6,15 @@ start times for one specific calendar date, and excludes any start time
 already occupied by an existing, active appointment for that same
 provider on that same date.
 
-NOT wired into chatbot_logic.py, webhook.py, or the frontend yet - see
-backend/PROVIDER_AVAILABILITY_NOTES.md. This module is pure computation:
-appointments.json is only ever opened in 'r' mode (or an in-memory list is
-used instead, via the `appointments` parameter), and nothing here writes
-to any file. No Flask, frontend, or LLM/assistant import anywhere in this
-module.
+Wired into chatbot_logic.py's live booking flow as of Phase 6.1, Slice 3:
+_format_slot_list() calls get_available_slots() as part of
+_handle_book_appointment's NAME -> PROVIDER -> DATE -> SLOT -> CONFIRM ->
+BOOKED sequence - see backend/PROVIDER_AVAILABILITY_NOTES.md. Still not
+imported by webhook.py or the frontend directly, and still pure
+computation: appointments.json is only ever opened in 'r' mode (or an
+in-memory list is used instead, via the `appointments` parameter), and
+nothing here writes to any file. No Flask or LLM/assistant import
+anywhere in this module.
 
 What this module WILL do:
   - Generate grid-aligned candidate slots from a provider's recurring
@@ -32,8 +35,11 @@ What this module WILL NOT do (deliberately out of scope for this slice):
     that is still out of scope, per provider_repository.py's own notes.
   - Do any timezone conversion. Every date/time here is local clinic
     time, exactly as written - see PROVIDER_AVAILABILITY_NOTES.md.
-  - Touch chatbot_logic.py, webhook.py, response_model.py, or any
-    conversation flow. Booking/update/cancel behavior is unchanged.
+  - Implement any conversation-flow or HTTP logic itself, or write to
+    chatbot_logic.py's, webhook.py's, or response_model.py's own files -
+    this module stays pure computation, called BY chatbot_logic.py's
+    booking flow (see this module's own opening note above) rather than
+    calling into it.
   - Introduce appointment IDs, database/ORM code, or locking/concurrency
     infrastructure.
 

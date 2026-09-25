@@ -1,15 +1,21 @@
-"""Configuration for the (not-yet-wired-in) LLM assistant feature.
+"""Configuration for the LLM assistant feature.
 
 Everything here is read from environment variables with explicit, safe
-defaults. Nothing in this module makes a network call, and nothing in the
-live chatbot dispatch (chatbot_logic.py / webhook.py) imports it yet - see
+defaults. Nothing in this module makes a network call. chatbot_logic.py
+does import this module and reads LLM_ENABLED to gate the General FAQ ->
+assistant_service.answer() -> claude_provider path (see
+backend/LLM_ASSISTANT_NOTES.md) - but LLM_ENABLED defaults to False below,
+so being wired in does not mean the assistant answers by default; a real
+Anthropic API call additionally requires a configured ANTHROPIC_API_KEY
+(see get_api_key()/has_api_key() below) - see
 backend/claude_provider.py's module docstring for the current scope.
 """
 import os
 
-# Master switch, off by default. Installing the anthropic SDK and adding
-# this module has zero effect on current behavior until a later, separate
-# phase both wires it into chatbot_logic.py AND someone opts in here.
+# Master switch, off by default. chatbot_logic.py is already wired to
+# check this flag (see module docstring above) - setting it to true is
+# the only step needed to opt into the General FAQ LLM path; no further
+# wiring is required.
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "false").strip().lower() == "true"
 
 # No "latest" - an explicit, reviewable default that only changes when a

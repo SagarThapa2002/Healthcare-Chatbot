@@ -6,10 +6,14 @@ about healthcare policy, safety guardrails, conversation routing, or
 conversation history - that belongs in a later, separate module
 (assistant_service.py) that would call this one.
 
-Not called from anywhere in the live chatbot yet: chatbot_logic.py and
-webhook.py do not import this module. Importing this module never makes a
-network call - the Anthropic client is only constructed, and the API is
-only called, inside generate_reply().
+Reached from the live chatbot via assistant_service.py (called from
+chatbot_logic.py's _handle_general_faq(), see
+backend/LLM_ASSISTANT_NOTES.md) - webhook.py itself still does not import
+this module directly. Importing this module never makes a network call -
+the Anthropic client is only constructed, and the API is only called,
+inside generate_reply(), and only when assistant_service._get_provider()
+selects this module (the default) after LLM_ENABLED and the policy check
+both pass.
 
 Verified against the actually-installed anthropic==1.7.0 package via
 direct introspection (constructor signatures, exception hierarchy, default

@@ -1,17 +1,28 @@
 # LLM assistant — design notes and current status
 
-## Current status: built, tested, NOT wired into the live chatbot
+## Current status: wired into the General FAQ path, disabled by default
 
-`chatbot_logic.py` does not import `assistant_service.py` or `claude_provider.py`.
-`LLM_ENABLED` defaults to `false` (`backend/llm_config.py`). No code path in
-this repository makes a real call to the Anthropic API. Every test in
-`backend/tests/test_claude_provider.py` and `backend/tests/test_assistant_service.py`
-mocks the SDK client entirely and passes without an `ANTHROPIC_API_KEY` set.
+`chatbot_logic.py` imports `assistant_service.py` (which itself imports
+`claude_provider.py`). The General FAQ intent handler,
+`_handle_general_faq()`, calls `assistant_service.answer()` whenever a
+message is present - see that function's own docstring. `LLM_ENABLED`
+still defaults to `false` (`backend/llm_config.py`), so being wired in
+does not mean the assistant answers by default: an operator must
+explicitly set `LLM_ENABLED=true`, and a real call to the Anthropic API
+additionally requires a configured `ANTHROPIC_API_KEY` (`claude_provider.py`
+raises `ProviderConfigError` otherwise). The deterministic `mock` provider
+(`backend/mock_provider.py`, opt-in via `LLM_PROVIDER=mock`) remains
+available for exercising this path in local development/tests without
+either requirement. Every test in `backend/tests/test_claude_provider.py`
+and `backend/tests/test_assistant_service.py` mocks the SDK client
+entirely and passes without an `ANTHROPIC_API_KEY` set.
 
 ## Architecture
 
 ```
-chatbot_logic.py           (not yet calling any of this)
+frontend (useConversation.js: General FAQ sends { message: text })
+    v
+chatbot_logic.py._handle_general_faq()   <- checks LLM_ENABLED + message present
     v
 assistant_service.py        <- safety/policy boundary (this phase)
     v
@@ -100,12 +111,12 @@ The system prompt is a scope/boundary statement, not clinical guidance.
   and non-exhaustive - false negatives (a request that should be refused
   but isn't recognized) are expected and should be found through real
   testing, not assumed away.
-- The exact wiring point in `chatbot_logic.py` and how `assistant_service.answer()`'s
-  result maps onto a `response_model.py` message type - deliberately not
-  done in this phase (see Phase 5.4 planning notes for the sequencing
-  reason: an unrecognized frontend message type falls back to an
-  unhelpful generic string, so backend and frontend changes for that must
-  land together).
+- ~~The exact wiring point in `chatbot_logic.py` and how
+  `assistant_service.answer()`'s result maps onto a `response_model.py`
+  message type~~ - resolved: wired at `_handle_general_faq()`, which maps
+  an allowed LLM response onto `response_model.assistant_response_message()`
+  and every other outcome (refused/disabled/failed) onto the existing
+  `response_model.text_message()` (see that function's own docstring).
 - Whether/how a future router should also pass conversation-level context
   (e.g. "the user is mid-symptom-check") into the policy decision - out of
   scope here; this phase only ever sees one plain message at a time.

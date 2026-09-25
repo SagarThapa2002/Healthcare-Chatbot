@@ -1,10 +1,12 @@
 """Deterministic repository for provider and provider-availability data.
 
-Phase 6.1, Slice 1: a small, standalone foundation only. NOT wired into
-chatbot_logic.py or the live webhook dispatch yet - booking/update/cancel
-behavior is completely unchanged by this module's existence. See
-backend/PROVIDER_AVAILABILITY_NOTES.md for what this is (and isn't) meant to
-support yet.
+Phase 6.1, Slice 1 built this as a small, standalone foundation. Slice 3
+wired it into the live booking flow: chatbot_logic.py's
+_format_provider_list() and choose-provider handling call
+list_providers() (via _handle_book_appointment), as part of the booking
+sequence NAME -> PROVIDER -> DATE -> SLOT -> CONFIRM -> BOOKED. See
+backend/PROVIDER_AVAILABILITY_NOTES.md for the full history and current
+scope.
 
 What this module WILL do:
   - Load and strictly validate backend/providers.json and

@@ -61,17 +61,34 @@ This project demonstrates a healthcare chatbot that:
 
 - Python 3.x
 - Pip
-- Ngrok
+- Node.js & npm
+- Ngrok (optional - see "Technologies Used" above)
 - Git
 
 ### Clone the Repository
 
 ```bash
 git clone https://github.com/your-username/healthcare-chatbot.git
-cd healthcare-chatbot/backend
-pip install -r requirements.txt
+cd healthcare-chatbot
+```
+
+### Backend Setup
+
+`app.py` lives at the repository root and imports `backend.webhook`, so it
+must be run from the repository root - not from inside `backend/`:
+
+```bash
+pip install -r backend/requirements.txt
 python app.py
 ngrok http 5000
+```
+
+### Frontend Setup
+
+```bash
+cd frontend
+npm install
+npm start
 ```
 
 ---
