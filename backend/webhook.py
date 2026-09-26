@@ -2,7 +2,7 @@ import logging
 
 from flask import Blueprint, request, jsonify
 
-from backend import reminder_service, response_model
+from backend import provider_repository, reminder_service, response_model
 from backend.chatbot_logic import handle_webhook_request, list_appointments
 
 logger = logging.getLogger(__name__)
@@ -55,3 +55,20 @@ def get_reminders():
     # by an opaque appointmentId), so this is no more sensitive than the
     # existing /appointments endpoint above - if anything, less so.
     return jsonify(reminder_service.list_reminders())
+
+
+@webhook_bp.route('/providers', methods=['GET'])
+def get_providers():
+    # Read-only - mirrors get_appointments()/get_reminders() above. Unlike
+    # those two, provider_repository.list_providers() does NOT tolerate a
+    # missing/malformed providers.json - it raises ProviderDataError (see
+    # provider_repository.py's own "fail loudly, never silently guess"
+    # convention, matching symptom_triage.py's identical policy). That is
+    # deliberately left to propagate here rather than caught and papered
+    # over with an empty list: providers.json is core reference data (not
+    # incidental per-request records like appointments/reminders), so a
+    # corrupt file should be a loud, visible failure, not a silently empty
+    # provider list. Provider records carry no patient-identifying content
+    # (id/name/specialty/location only), so this is no more sensitive than
+    # the existing /appointments and /reminders routes above.
+    return jsonify(provider_repository.list_providers())

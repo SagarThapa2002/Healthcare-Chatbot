@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app import app
-from backend import availability_service, chatbot_logic, reminder_service
+from backend import availability_service, chatbot_logic, provider_repository, reminder_service
 
 
 class WebhookTestCase(unittest.TestCase):
@@ -545,6 +545,71 @@ class GetRemindersTest(unittest.TestCase):
             after_appointments = f.read()
         self.assertEqual(before_reminders, after_reminders)
         self.assertEqual(before_appointments, after_appointments)
+
+
+class GetProvidersTest(unittest.TestCase):
+    """Isolated tests for GET /webhook/providers - self-contained, not a
+    subclass of WebhookTestCase above (that class isolates only
+    chatbot_logic's/availability_service's own APPOINTMENTS_FILE-family
+    constants, never provider_repository.PROVIDERS_FILE). Every test here
+    redirects provider_repository.PROVIDERS_FILE to a temp path first, so
+    the real backend/providers.json is never read from by any test in
+    this class.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.providers_file = os.path.join(self.tmp_dir.name, 'providers.json')
+
+        patcher = patch.object(provider_repository, 'PROVIDERS_FILE', self.providers_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.client = app.test_client()
+
+    def _write_providers(self, providers):
+        with open(self.providers_file, 'w') as f:
+            json.dump(providers, f)
+
+    def test_empty_providers_file_returns_empty_list(self):
+        self._write_providers([])
+
+        response = self.client.get('/webhook/providers')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), [])
+
+    def test_populated_provider_is_returned_with_exact_fields(self):
+        provider = {
+            "id": "dr-patel", "name": "Dr. Patel", "specialty": "General Practice",
+            "location": "Main Clinic",
+        }
+        self._write_providers([provider])
+
+        response = self.client.get('/webhook/providers')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), [provider])
+
+    def test_multiple_providers_are_returned_in_file_order(self):
+        providers = [
+            {"id": "dr-patel", "name": "Dr. Patel", "specialty": "General Practice", "location": "Main Clinic"},
+            {"id": "dr-nguyen", "name": "Dr. Nguyen", "specialty": "Pediatrics", "location": "Main Clinic"},
+        ]
+        self._write_providers(providers)
+
+        response = self.client.get('/webhook/providers')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), providers)
+
+    def test_response_content_type_is_json(self):
+        self._write_providers([])
+
+        response = self.client.get('/webhook/providers')
+
+        self.assertEqual(response.content_type, 'application/json')
 
 
 if __name__ == '__main__':
