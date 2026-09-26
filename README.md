@@ -43,6 +43,15 @@ This project demonstrates a healthcare chatbot that:
 - **API to View Appointments**  
   Access booked appointments via GET request to `/webhook/appointments`.
 
+- **Chat Webhook**
+  Chat messages are sent as `POST /webhook/webhook` - the blueprint's `/webhook` prefix combined with the route's own `/webhook` path.
+
+- **Appointments View**
+  A read-only Appointments tab in the frontend lists your active appointments (name, date, time, and provider when known). Booking, updating, and cancelling an appointment still happens through chat.
+
+- **General Health Questions**
+  An optional, disabled-by-default LLM-backed assistant can answer general health questions that don't match any other intent, controlled by the `LLM_ENABLED` environment variable. See `backend/LLM_ASSISTANT_NOTES.md` for details.
+
 ---
 
 ## ⚙️ Technologies Used
@@ -82,6 +91,13 @@ pip install -r backend/requirements.txt
 python app.py
 ngrok http 5000
 ```
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLASK_DEBUG` | off (`false`) | Set to `true` to enable Flask's debug mode (interactive debugger, auto-reload) for local development only — never enable this outside your own machine. |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated list of origins allowed to call the API. Defaults to the local frontend dev server only; set this to your own frontend's origin(s) if it runs anywhere else. |
 
 ### Frontend Setup
 
@@ -145,3 +161,9 @@ This subsystem is intentionally scoped and should not be mistaken for a producti
 - **No retry policy** - a `failed` reminder is a terminal outcome; it is never automatically retried.
 - **At-least-once, not exactly-once, delivery semantics** - if the process crashes after a notification is sent but before that outcome is saved, the next run may attempt to send it again.
 - **No file locking or concurrent-invocation protection** - only one invocation of `run_due_reminders` should run at a time.
+
+---
+
+## 🔒 Security & Production Readiness
+
+Debug mode and CORS are both restricted by default (see Configuration above), but this project has no authentication, no rate limiting, and no HTTPS. It remains a prototype, not a production-hardened service.
