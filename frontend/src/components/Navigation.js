@@ -1,6 +1,6 @@
 const NAV_ITEMS = [
   { id: 'chat', label: 'Chat' },
-  { id: 'appointments', label: 'Appointments', badge: 'Coming soon' },
+  { id: 'appointments', label: 'Appointments' },
   { id: 'about', label: 'About / Help', badge: 'Preview' },
 ];
 

@@ -3,12 +3,12 @@ import Header from './Header';
 import Navigation from './Navigation';
 import SafetyBanner from './SafetyBanner';
 import Chatbot from './Chatbot';
-import AppointmentsPlaceholder from './AppointmentsPlaceholder';
+import AppointmentsView from './AppointmentsView';
 import AboutPlaceholder from './AboutPlaceholder';
 
 const VIEWS = {
   chat: Chatbot,
-  appointments: AppointmentsPlaceholder,
+  appointments: AppointmentsView,
   about: AboutPlaceholder,
 };
 
