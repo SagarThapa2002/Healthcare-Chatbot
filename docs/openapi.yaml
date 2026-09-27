@@ -1,0 +1,543 @@
+openapi: 3.0.3
+info:
+  title: Healthcare Chatbot API
+  version: 1.0.0
+  description: |
+    Contract for the HTTP API as currently implemented in `app.py` and
+    `backend/webhook.py`. It describes existing behaviour only - it is not
+    a design target.
+
+    **No authentication, authorization, or rate limiting is implemented.**
+    Every endpoint below is publicly callable by anyone who can reach the
+    server. Browser access is restricted only by CORS
+    (`CORS_ALLOWED_ORIGINS`, default `http://localhost:3000`).
+
+    Things worth knowing before integrating:
+
+    - `POST /webhook/webhook` always returns HTTP 200, including on
+      failure. Clients must check the `success` field of the envelope, not
+      the HTTP status.
+    - The `GET` list endpoints return raw JSON arrays with no envelope.
+    - Conversation state (pending booking/update/cancellation) is held
+      server-side in shared files, not per client or per session.
+servers:
+  - url: http://127.0.0.1:5000
+    description: Local development server (`python app.py`), as used by frontend/src/api/client.js
+tags:
+  - name: Status
+  - name: Chatbot
+  - name: Appointments
+  - name: Providers
+  - name: Reminders
+
+paths:
+  /:
+    get:
+      tags: [Status]
+      operationId: getStatus
+      summary: Health/status message
+      responses:
+        '200':
+          description: The API is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /webhook/webhook:
+    post:
+      tags: [Chatbot]
+      operationId: postWebhook
+      summary: Send one conversational turn to the chatbot
+      description: |
+        Dispatches on `queryResult.intent.displayName`. The request body
+        uses a Dialogflow-style shape, but this endpoint is called directly
+        by the React frontend (frontend/src/api/client.js).
+
+        The body is parsed as JSON regardless of the `Content-Type` header.
+        All fields are optional: `{}` is accepted and treated as an
+        unrecognised (empty) intent, which returns a successful "didn't
+        understand" reply.
+
+        If the body is not valid JSON, or is valid JSON but not an object
+        (for example `[]` or `null`), the endpoint still returns HTTP 200
+        with an error envelope (`success: false`, `error.code:
+        INTERNAL_ERROR`).
+
+        Booking, update and cancellation are multi-turn flows. Each turn is
+        one request, and `context.bookingStage` / `updateStage` /
+        `cancellationStage` report what the server is now waiting for.
+        `YesIntent` and `NoIntent` confirm or decline whichever pending
+        transaction currently exists on the server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+            examples:
+              bookName:
+                summary: Start a booking with a patient name
+                value:
+                  queryResult:
+                    intent: { displayName: Book Appointment }
+                    parameters: { name: Jane Doe }
+              confirm:
+                summary: Confirm the pending transaction
+                value:
+                  queryResult:
+                    intent: { displayName: YesIntent }
+                    parameters: {}
+      responses:
+        '200':
+          description: |
+            Always 200. Either a success envelope (`success: true`) or an
+            error envelope (`success: false`). The intent-specific outcome,
+            including "not found" or "slot unavailable", is carried in
+            `messages` of a success envelope.
+          content:
+            application/json:
+              schema:
+                # Distinguished by the boolean `success` field. OpenAPI
+                # discriminators only support string values, so none is
+                # declared here.
+                oneOf:
+                  - $ref: '#/components/schemas/ChatbotSuccessResponse'
+                  - $ref: '#/components/schemas/ChatbotErrorResponse'
+        '405':
+          $ref: '#/components/responses/FlaskHtmlError'
+
+  /webhook/appointments:
+    get:
+      tags: [Appointments]
+      operationId: listAppointments
+      summary: List all appointment records
+      description: |
+        Returns the contents of backend/appointments.json as-is, with no
+        envelope or filtering. Cancelled appointments are included (with
+        `status: cancelled`). A missing file or invalid JSON returns `[]`.
+        Used by the frontend's appointments view.
+      responses:
+        '200':
+          description: All appointment records, in file order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Appointment'
+
+  /webhook/providers:
+    get:
+      tags: [Providers]
+      operationId: listProviders
+      summary: List all providers
+      description: |
+        Returns every provider from backend/providers.json, in file order.
+        Unlike the appointments and reminders endpoints, a missing or
+        invalid providers.json is not converted to `[]`: the error
+        propagates and Flask returns its default HTML 500 page.
+        Provider availability is not exposed by any endpoint.
+      responses:
+        '200':
+          description: All providers.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Provider'
+        '500':
+          $ref: '#/components/responses/FlaskHtmlError'
+
+  /webhook/reminders:
+    get:
+      tags: [Reminders]
+      operationId: listReminders
+      summary: List all reminder records
+      description: |
+        Read-only view of backend/reminders.json, returned as-is with no
+        envelope. It does not process or send reminders. A missing file or
+        invalid JSON returns `[]`.
+      responses:
+        '200':
+          description: All reminder records, in file order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Reminder'
+
+components:
+  responses:
+    FlaskHtmlError:
+      description: Flask/Werkzeug default HTML error page (not JSON).
+      content:
+        text/html:
+          schema:
+            type: string
+
+  schemas:
+    StatusResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: Healthcare Chatbot API is running.
+
+    # ---- Request ----------------------------------------------------------
+
+    WebhookRequest:
+      type: object
+      properties:
+        queryResult:
+          type: object
+          properties:
+            intent:
+              type: object
+              properties:
+                displayName:
+                  $ref: '#/components/schemas/IntentName'
+            parameters:
+              $ref: '#/components/schemas/WebhookParameters'
+
+    IntentName:
+      type: string
+      description: |
+        Intents the backend dispatches on. Any other value (including an
+        empty or missing name) returns a successful "Sorry, I didn't
+        understand that" text reply, so this is documented as a plain
+        string rather than a strict enum.
+      example: Book Appointment
+      x-known-values:
+        - Symptom Check
+        - Book Appointment
+        - YesIntent
+        - NoIntent
+        - Update Appointment
+        - Cancel Appointment
+        - View Appointments
+        - General FAQ
+
+    WebhookParameters:
+      type: object
+      description: |
+        Per-intent parameters. All are optional. Each handler reads only
+        the fields it needs and ignores the rest.
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+          description: Patient name. Used by Book, Update and Cancel Appointment (Update/Cancel match it case-insensitively when no `id` is given).
+        providerId:
+          type: string
+          description: Book Appointment. A provider choice, resolved in order as a 1-based number from the listed providers, an exact provider id, or an exact provider name (case-insensitive).
+        date:
+          type: string
+          description: Book Appointment (appointment date) or Update Appointment (new date).
+          example: '2026-10-05'
+        time:
+          type: string
+          description: Book Appointment (an HH:MM slot or a 1-based number from the listed slots) or Update Appointment (new time).
+          example: '09:30'
+        id:
+          type: string
+          description: Update and Cancel Appointment. Must exactly match an active appointment's id; there is no fallback to `name` if it doesn't.
+        symptom:
+          type: string
+          description: Symptom Check. The symptom being reported.
+        message:
+          type: string
+          description: General FAQ. The user's raw question.
+
+    # ---- Response envelope ------------------------------------------------
+
+    ChatbotSuccessResponse:
+      type: object
+      required: [success, error, messages, context, meta]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        error:
+          type: object
+          nullable: true
+          description: Always null on success.
+          enum: [null]
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        context:
+          $ref: '#/components/schemas/ResponseContext'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    ChatbotErrorResponse:
+      type: object
+      required: [success, error, messages, context, meta]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          $ref: '#/components/schemas/Error'
+        messages:
+          type: array
+          maxItems: 0
+          description: Always empty on error.
+          items:
+            $ref: '#/components/schemas/Message'
+        context:
+          type: object
+          nullable: true
+          description: Always null on error.
+          enum: [null]
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Only INTERNAL_ERROR is emitted today.
+          example: INTERNAL_ERROR
+        message:
+          type: string
+          example: Oops, something went wrong on the server.
+
+    ResponseContext:
+      type: object
+      required: [intent]
+      description: |
+        The stage fields are present only when the handled turn belongs to
+        that flow and produced a stage. They are omitted entirely (not
+        null) otherwise, and at most one of them appears in a response.
+      properties:
+        intent:
+          type: string
+          description: The `displayName` from the request, echoed back (empty string if none was sent).
+        bookingStage:
+          type: string
+          enum: [name, provider, date, slot, confirm, booked]
+          description: What the booking flow is now waiting on, or `booked` once an appointment has been persisted.
+        updateStage:
+          type: string
+          enum: [identifier, fields, confirm, updated]
+        cancellationStage:
+          type: string
+          enum: [identifier, confirm, cancelled]
+
+    ResponseMeta:
+      type: object
+      required: [schemaVersion, requestId, timestamp]
+      properties:
+        schemaVersion:
+          type: string
+          enum: ['1.0']
+        requestId:
+          type: string
+          format: uuid
+          description: One id per request. It also appears in server logs, for correlation.
+        timestamp:
+          type: string
+          format: date-time
+          description: UTC, ISO 8601 with offset.
+
+    # ---- Messages ---------------------------------------------------------
+
+    Message:
+      description: |
+        Message types emitted today are `text`, `booking_confirmation` and
+        `assistant_response`. `backend/response_model.py` also defines
+        `validation_error` and `symptom_guidance` builders, but no endpoint
+        emits them yet, so they are intentionally left out of this contract.
+      oneOf:
+        - $ref: '#/components/schemas/TextMessage'
+        - $ref: '#/components/schemas/BookingConfirmationMessage'
+        - $ref: '#/components/schemas/AssistantResponseMessage'
+      discriminator:
+        propertyName: type
+        mapping:
+          text: '#/components/schemas/TextMessage'
+          booking_confirmation: '#/components/schemas/BookingConfirmationMessage'
+          assistant_response: '#/components/schemas/AssistantResponseMessage'
+
+    Suggestions:
+      type: array
+      description: |
+        Always present, usually empty. It is non-empty only on the `text`
+        message that asks the user to pick one of several matching
+        appointments during Update or Cancel Appointment
+        (`updateStage`/`cancellationStage` = `identifier`).
+      items:
+        $ref: '#/components/schemas/Suggestion'
+
+    Suggestion:
+      type: object
+      required: [id, label, value]
+      properties:
+        id:
+          type: string
+          description: The candidate appointment's id.
+        label:
+          type: string
+          example: 2026-10-05 at 09:30
+        value:
+          type: string
+          description: The value to send back as `parameters.id` (currently identical to `id`).
+
+    TextMessage:
+      type: object
+      required: [type, content, suggestions]
+      properties:
+        type:
+          type: string
+          enum: [text]
+        content:
+          type: object
+          required: [text]
+          properties:
+            text:
+              type: string
+        suggestions:
+          $ref: '#/components/schemas/Suggestions'
+
+    BookingConfirmationMessage:
+      type: object
+      required: [type, content, suggestions]
+      description: Emitted only when a new appointment has actually been persisted (a YesIntent that confirms a pending booking).
+      properties:
+        type:
+          type: string
+          enum: [booking_confirmation]
+        content:
+          type: object
+          required: [text, appointment]
+          properties:
+            text:
+              type: string
+            appointment:
+              $ref: '#/components/schemas/Appointment'
+        suggestions:
+          $ref: '#/components/schemas/Suggestions'
+
+    AssistantResponseMessage:
+      type: object
+      required: [type, content, suggestions]
+      description: |
+        Emitted only for a General FAQ turn that the LLM assistant actually
+        answered. This requires `LLM_ENABLED=true` and the reply passing
+        the assistant's safety checks. Otherwise General FAQ returns a
+        plain `text` message.
+      properties:
+        type:
+          type: string
+          enum: [assistant_response]
+        content:
+          type: object
+          required: [text, provider, disclaimer]
+          properties:
+            text:
+              type: string
+            provider:
+              type: string
+              enum: [claude, mock]
+              description: The provider that actually produced the text (`mock` only when `LLM_PROVIDER=mock`).
+            disclaimer:
+              type: string
+              enum: ['AI-generated general information, not medical advice.']
+        suggestions:
+          $ref: '#/components/schemas/Suggestions'
+
+    # ---- Data records -----------------------------------------------------
+
+    Appointment:
+      type: object
+      required: [name, date, time]
+      description: |
+        A stored appointment record, returned as-is. Older (legacy) records
+        have only `name`, `date` and `time`. Records created by the current
+        booking flow also carry `id` and `providerId`. `status` is absent
+        for active appointments and is set to `cancelled` on cancellation
+        (records are never deleted).
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Present on appointments booked by the current flow; absent on legacy records.
+        name:
+          type: string
+        providerId:
+          type: string
+          description: Present on appointments booked by the current flow; absent on legacy records.
+          example: dr-patel
+        date:
+          type: string
+          example: '2026-10-05'
+        time:
+          type: string
+          example: '09:30'
+        status:
+          type: string
+          enum: [cancelled]
+          description: Present only once the appointment has been cancelled.
+
+    Provider:
+      type: object
+      required: [id, name, specialty, location]
+      description: A provider record from backend/providers.json, returned as-is. The listed fields are required by the server's own validation.
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          example: dr-patel
+        name:
+          type: string
+          example: Dr. Patel
+        specialty:
+          type: string
+          example: General Practice
+        location:
+          type: string
+          example: Main Clinic
+
+    Reminder:
+      type: object
+      required: [id, appointmentId, type, sendAt, status, createdAt, sentAt, failureReason]
+      description: A reminder record from backend/reminders.json, returned as-is. It carries no patient name, date or time, only an appointment reference.
+      properties:
+        id:
+          type: string
+          format: uuid
+        appointmentId:
+          type: string
+          description: The `id` of the referenced appointment.
+        type:
+          type: string
+          enum: [24h_before]
+        sendAt:
+          type: string
+          format: date-time
+          description: UTC, ISO 8601 with offset. 24 hours before the appointment in CLINIC_TIMEZONE.
+        status:
+          type: string
+          enum: [pending, sent, failed, cancelled]
+        createdAt:
+          type: string
+          format: date-time
+        sentAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set only when status is `sent`.
+        failureReason:
+          type: string
+          nullable: true
+          enum: [send_failed, appointment_not_found, null]
+          description: Set only when status is `failed`.

@@ -164,6 +164,16 @@ This subsystem is intentionally scoped and should not be mistaken for a producti
 
 ---
 
+## 📄 API Contract (OpenAPI)
+
+The HTTP API is documented as an OpenAPI 3.0 specification in [`docs/openapi.yaml`](docs/openapi.yaml). It covers every route the backend registers: `GET /`, `POST /webhook/webhook`, `GET /webhook/appointments`, `GET /webhook/providers` and `GET /webhook/reminders`. For each one it gives the request body, the response envelope (messages, context stages and metadata) and the appointment, provider and reminder record shapes.
+
+The spec describes the implementation **as it exists today**, including its quirks. For example, `POST /webhook/webhook` returns HTTP 200 even for errors (check the `success` field), and the list endpoints return bare JSON arrays. It is a static file, and no Swagger UI or other tooling is bundled. Open it in any OpenAPI viewer or editor.
+
+**Authentication is not implemented.** Every endpoint is publicly callable by anyone who can reach the server.
+
+---
+
 ## 🔒 Security & Production Readiness
 
 Debug mode and CORS are both restricted by default (see Configuration above), but this project has no authentication, no rate limiting, and no HTTPS. It remains a prototype, not a production-hardened service.
