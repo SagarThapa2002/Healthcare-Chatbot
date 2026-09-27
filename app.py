@@ -23,6 +23,13 @@ logging.basicConfig(
 # unchanged with zero configuration.
 DEFAULT_DEV_ORIGIN = "http://localhost:3000"
 
+# Flask-Cors 4.0.0 treats any origin string containing one of these
+# characters as a regex (flask_cors.core.probably_regex) and matches it
+# with re.match - a prefix match. So "*" would allow every origin, and a
+# typo like "https://app.example.com?" would also allow
+# "https://app.example.co.evil.com". Literal origins never need them.
+_REGEX_CHARS = frozenset('*\\?$^[]()')
+
 
 def _parse_allowed_origins(raw_value):
     """Parses CORS_ALLOWED_ORIGINS into a list of origins for flask_cors.
@@ -34,10 +41,21 @@ def _parse_allowed_origins(raw_value):
     resolving to "allow every origin" (flask_cors's own default) and never
     to "allow no origin", either of which a malformed value could
     otherwise produce silently.
+
+    Raises ValueError if any entry contains a regex character (see
+    _REGEX_CHARS) - failing loudly at startup rather than dropping the
+    entry, so a misconfiguration is never silently accepted.
     """
     if not raw_value or not raw_value.strip():
         return [DEFAULT_DEV_ORIGIN]
     origins = [origin.strip() for origin in raw_value.split(',') if origin.strip()]
+    for origin in origins:
+        if _REGEX_CHARS.intersection(origin):
+            raise ValueError(
+                f"Invalid CORS_ALLOWED_ORIGINS entry {origin!r}: wildcards and "
+                "regex characters are not allowed - list each exact origin, "
+                "e.g. https://app.example.com"
+            )
     return origins or [DEFAULT_DEV_ORIGIN]
 
 

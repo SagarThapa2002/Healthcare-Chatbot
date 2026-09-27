@@ -66,6 +66,28 @@ class ParseAllowedOriginsTest(unittest.TestCase):
             ["http://localhost:3000", "https://example.invalid"],
         )
 
+    def test_wildcard_is_rejected(self):
+        # flask_cors would treat "*" as "allow every origin".
+        with self.assertRaises(ValueError):
+            _parse_allowed_origins("*")
+
+    def test_regex_character_typo_is_rejected(self):
+        # flask_cors would regex prefix-match this, also allowing
+        # "https://app.example.co.evil.com".
+        with self.assertRaises(ValueError):
+            _parse_allowed_origins("https://app.example.com?")
+
+    def test_any_regex_character_is_rejected(self):
+        for char in '*\\?$^[]()':
+            with self.subTest(char=char):
+                with self.assertRaises(ValueError):
+                    _parse_allowed_origins(f"https://app{char}.example.invalid")
+
+    def test_one_bad_entry_in_a_list_rejects_the_whole_value(self):
+        # Never silently drop the bad entry and carry on with the rest.
+        with self.assertRaises(ValueError):
+            _parse_allowed_origins("http://localhost:3000, https://*.example.invalid")
+
 
 class CorsDefaultBehaviorTest(unittest.TestCase):
     """Integration-level: exercises the actual, already-configured `app`

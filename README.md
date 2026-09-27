@@ -97,7 +97,7 @@ ngrok http 5000
 | Variable | Default | Purpose |
 |---|---|---|
 | `FLASK_DEBUG` | off (`false`) | Set to `true` to enable Flask's debug mode (interactive debugger, auto-reload) for local development only — never enable this outside your own machine. |
-| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated list of origins allowed to call the API. Defaults to the local frontend dev server only; set this to your own frontend's origin(s) if it runs anywhere else. |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated list of origins allowed to call the API. Defaults to the local frontend dev server only; set this to your own frontend's origin(s) if it runs anywhere else. Must contain exact origins; wildcards and regex characters are rejected. |
 
 ### Frontend Setup
 
