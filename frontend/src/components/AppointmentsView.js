@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getAppointments } from '../api/client';
+import { getAppointments, getProviders } from '../api/client';
 import ErrorBanner from './chat/ErrorBanner';
 
 // Appointment records are never deleted, only status-flagged (see
@@ -13,18 +13,41 @@ function isActive(appointment) {
 }
 
 // Appointments only ever store an opaque providerId (see
-// backend/chatbot_logic.py's _handle_yes_intent) - there is no provider
-// name field on the record, and no GET /webhook/providers endpoint to
-// resolve one. This is a pure display reformat of the id that IS present
-// ("dr-patel" -> "Dr Patel") - never a lookup, and never invented for a
-// legacy record that has no providerId at all (see the `provider &&`
-// guard below, where this is only ever called on a truthy id).
+// backend/chatbot_logic.py's _handle_yes_intent) - the provider's name,
+// specialty, and location are resolved from GET /webhook/providers
+// instead (see describeProvider below).
+//
+// This is the fallback display for when that lookup can't resolve the
+// id (the providers request failed, or the id isn't in the list): a pure
+// reformat of the id that IS present ("dr-patel" -> "Dr Patel") - never
+// invented for a legacy record that has no providerId at all.
 function formatProviderId(providerId) {
   return providerId
     .split(/[-_]+/)
     .filter(Boolean)
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join(' ');
+}
+
+// Builds a providerId -> provider lookup once per load, rather than
+// searching the list for every card. Tolerates a non-array response and
+// entries without an id by simply leaving them out of the lookup.
+function indexProviders(providers) {
+  const byId = new Map();
+  if (Array.isArray(providers)) {
+    providers.forEach((provider) => {
+      if (provider && provider.id) byId.set(provider.id, provider);
+    });
+  }
+  return byId;
+}
+
+// "Dr. Patel · General Practice · Main Clinic" for a known provider, the
+// formatted id otherwise. Only called for a truthy providerId.
+function describeProvider(providerId, providersById) {
+  const provider = providersById.get(providerId);
+  if (!provider || !provider.name) return formatProviderId(providerId);
+  return [provider.name, provider.specialty, provider.location].filter(Boolean).join(' · ');
 }
 
 function LoadingState() {
@@ -51,8 +74,10 @@ function EmptyState() {
   );
 }
 
-function AppointmentCard({ appointment }) {
-  const provider = appointment.providerId ? formatProviderId(appointment.providerId) : null;
+function AppointmentCard({ appointment, providersById }) {
+  const provider = appointment.providerId
+    ? describeProvider(appointment.providerId, providersById)
+    : null;
 
   return (
     <li className="rounded-lg border border-border bg-surface p-4">
@@ -69,12 +94,18 @@ function AppointmentCard({ appointment }) {
 function AppointmentsView() {
   const [status, setStatus] = useState('loading'); // 'loading' | 'error' | 'ready'
   const [appointments, setAppointments] = useState([]);
+  const [providersById, setProvidersById] = useState(() => new Map());
 
+  // Both requests run in parallel. Only the appointments request decides
+  // the view's status: provider details are an enhancement, so a failed
+  // providers request resolves to [] (formatted-id fallback) rather than
+  // showing the error state or blocking the list.
   const load = () => {
     setStatus('loading');
-    getAppointments()
-      .then((data) => {
+    Promise.all([getAppointments(), getProviders().catch(() => [])])
+      .then(([data, providers]) => {
         setAppointments(Array.isArray(data) ? data : []);
+        setProvidersById(indexProviders(providers));
         setStatus('ready');
       })
       .catch(() => {
@@ -111,7 +142,7 @@ function AppointmentsView() {
         ) : (
           <ul className="flex flex-col gap-3">
             {activeAppointments.map((appointment, index) => (
-              <AppointmentCard key={appointment.id ?? `${appointment.name}-${appointment.date}-${appointment.time}-${index}`} appointment={appointment} />
+              <AppointmentCard key={appointment.id ?? `${appointment.name}-${appointment.date}-${appointment.time}-${index}`} appointment={appointment} providersById={providersById} />
             ))}
           </ul>
         )

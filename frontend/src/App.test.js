@@ -1,8 +1,8 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import App from './App';
-import { getAppointments } from './api/client';
+import { getAppointments, getProviders } from './api/client';
 
-// getAppointments is mocked so navigating to the Appointments tab never
+// getAppointments/getProviders are mocked so navigating to the Appointments tab never
 // makes a real network call in these tests - matching this project's
 // existing convention for testing anything that calls into api/client.js
 // (see hooks/useConversation.test.js). The other 3 tests below never
@@ -10,6 +10,7 @@ import { getAppointments } from './api/client';
 jest.mock('./api/client', () => ({
   callBackend: jest.fn(),
   getAppointments: jest.fn(),
+  getProviders: jest.fn(),
 }));
 
 describe('App', () => {
@@ -37,6 +38,8 @@ describe('App navigation (Appointments, About, and back to Chat)', () => {
   beforeEach(() => {
     getAppointments.mockReset();
     getAppointments.mockResolvedValue([]);
+    getProviders.mockReset();
+    getProviders.mockResolvedValue([]);
   });
 
   test('navigating to Appointments renders the real Appointments view and requests data via the API client', async () => {

@@ -23,4 +23,16 @@ async function getAppointments() {
   return response.json();
 }
 
-export { callBackend, getAppointments };
+// GET /webhook/providers returns the raw provider array as-is (see
+// backend/webhook.py's get_providers() and docs/openapi.yaml) - no
+// envelope, same as getAppointments above, and throws on a non-OK
+// response the same way.
+async function getProviders() {
+  const response = await fetch('http://127.0.0.1:5000/webhook/providers');
+  if (!response.ok) {
+    throw new Error(`Failed to load providers (status ${response.status})`);
+  }
+  return response.json();
+}
+
+export { callBackend, getAppointments, getProviders };

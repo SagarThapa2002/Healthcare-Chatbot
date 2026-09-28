@@ -1,18 +1,28 @@
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import AppointmentsView from './AppointmentsView';
-import { getAppointments } from '../api/client';
+import { getAppointments, getProviders } from '../api/client';
 
-// getAppointments (the network/JSON boundary) is mocked entirely, matching
+// getAppointments/getProviders (the network/JSON boundary) are mocked entirely, matching
 // this project's existing convention for testing components/hooks that
 // call into api/client.js (see useConversation.test.js) - these tests
 // never touch the network and don't need a real backend running.
 jest.mock('../api/client', () => ({
   getAppointments: jest.fn(),
+  getProviders: jest.fn(),
 }));
+
+const PROVIDERS = [
+  { id: 'dr-patel', name: 'Dr. Patel', specialty: 'General Practice', location: 'Main Clinic' },
+  { id: 'dr-okafor', name: 'Dr. Okafor', specialty: 'Dermatology', location: 'North Clinic' },
+];
 
 describe('AppointmentsView', () => {
   beforeEach(() => {
     getAppointments.mockReset();
+    getProviders.mockReset();
+    // Default: no provider details, so tests that don't care about the
+    // lookup exercise the formatted-id fallback, exactly as before.
+    getProviders.mockResolvedValue([]);
   });
 
   test('renders the Appointments region and heading', async () => {
@@ -122,5 +132,99 @@ describe('AppointmentsView', () => {
     render(<AppointmentsView />);
 
     await waitFor(() => expect(screen.getByText('sagar')).toBeInTheDocument());
+  });
+
+  describe('provider details', () => {
+    test('shows the provider name, specialty, and location for a known providerId', async () => {
+      getAppointments.mockResolvedValue([
+        { id: 'a1', name: 'Sagar', date: '2026-12-28', time: '09:00', providerId: 'dr-patel' },
+        { id: 'a2', name: 'Alex', date: '2026-12-29', time: '11:00', providerId: 'dr-okafor' },
+      ]);
+      getProviders.mockResolvedValue(PROVIDERS);
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('Sagar')).toBeInTheDocument());
+      expect(screen.getByText('Provider: Dr. Patel · General Practice · Main Clinic')).toBeInTheDocument();
+      expect(screen.getByText('Provider: Dr. Okafor · Dermatology · North Clinic')).toBeInTheDocument();
+    });
+
+    test('falls back to the formatted id, with no error state, when the providers request fails', async () => {
+      getAppointments.mockResolvedValue([
+        { id: 'a1', name: 'Sagar', date: '2026-12-28', time: '09:00', providerId: 'dr-patel' },
+      ]);
+      getProviders.mockRejectedValue(new Error('Failed to load providers (status 500)'));
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('Sagar')).toBeInTheDocument());
+      expect(screen.getByText('Provider: Dr Patel')).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    });
+
+    test('falls back to the formatted id for a providerId that is not in the providers list', async () => {
+      getAppointments.mockResolvedValue([
+        { id: 'a1', name: 'Sagar', date: '2026-12-28', time: '09:00', providerId: 'dr-unknown' },
+      ]);
+      getProviders.mockResolvedValue(PROVIDERS);
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('Sagar')).toBeInTheDocument());
+      expect(screen.getByText('Provider: Dr Unknown')).toBeInTheDocument();
+    });
+
+    test('a legacy appointment with no providerId still shows no provider line when providers load', async () => {
+      getAppointments.mockResolvedValue([
+        { name: 'sagar', date: '2026-09-18', time: '10:00' },
+      ]);
+      getProviders.mockResolvedValue(PROVIDERS);
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('sagar')).toBeInTheDocument());
+      expect(screen.queryByText(/Provider:/)).not.toBeInTheDocument();
+    });
+
+    test('tolerates a non-array providers response by falling back to the formatted id', async () => {
+      getAppointments.mockResolvedValue([
+        { id: 'a1', name: 'Sagar', date: '2026-12-28', time: '09:00', providerId: 'dr-patel' },
+      ]);
+      getProviders.mockResolvedValue({ unexpected: true });
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('Provider: Dr Patel')).toBeInTheDocument());
+    });
+
+    test('requests providers once per load, not once per appointment', async () => {
+      getAppointments.mockResolvedValue([
+        { id: 'a1', name: 'One', date: '2026-12-28', time: '09:00', providerId: 'dr-patel' },
+        { id: 'a2', name: 'Two', date: '2026-12-29', time: '10:00', providerId: 'dr-patel' },
+        { id: 'a3', name: 'Three', date: '2026-12-30', time: '11:00', providerId: 'dr-okafor' },
+      ]);
+      getProviders.mockResolvedValue(PROVIDERS);
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByText('Three')).toBeInTheDocument());
+      expect(getProviders).toHaveBeenCalledTimes(1);
+    });
+
+    test('an appointments failure still shows the error state, and retry reloads both', async () => {
+      getAppointments.mockRejectedValueOnce(new Error('boom'));
+      getProviders.mockResolvedValue(PROVIDERS);
+      render(<AppointmentsView />);
+
+      await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+      expect(getProviders).toHaveBeenCalledTimes(1);
+
+      getAppointments.mockResolvedValueOnce([
+        { id: 'a1', name: 'Sagar', date: '2026-12-28', time: '09:00', providerId: 'dr-patel' },
+      ]);
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+      await waitFor(() =>
+        expect(screen.getByText('Provider: Dr. Patel · General Practice · Main Clinic')).toBeInTheDocument()
+      );
+      expect(getAppointments).toHaveBeenCalledTimes(2);
+      expect(getProviders).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
   });
 });
