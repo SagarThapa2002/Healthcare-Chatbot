@@ -107,6 +107,23 @@ npm install
 npm start
 ```
 
+#### Frontend configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REACT_APP_API_BASE_URL` | `http://127.0.0.1:5000` | Base URL of the backend API that the frontend calls (e.g. `https://api.example.com`). Surrounding whitespace and trailing slashes are ignored; an unset or blank value falls back to the default. |
+
+Create React App applies `REACT_APP_*` variables when `npm start` or `npm run build` runs, so they are fixed at build time: changing the value requires rebuilding the production frontend. For example:
+
+```bash
+cd frontend
+REACT_APP_API_BASE_URL=https://api.example.com npm run build
+```
+
+The deployed frontend's origin must also be listed in the backend's `CORS_ALLOWED_ORIGINS` (see Configuration above), or the browser will block its requests.
+
+**Never put secrets, passwords, API keys or credentials in `REACT_APP_*` variables** - they are bundled into the frontend JavaScript and readable by anyone who loads the page.
+
 ---
 
 ## 🔔 Appointment Reminders
