@@ -68,7 +68,7 @@ This project demonstrates a healthcare chatbot that:
 
 ### Prerequisites
 
-- Python 3.x
+- Python 3.10+
 - Pip
 - Node.js & npm
 - Ngrok (optional - see "Technologies Used" above)
@@ -83,14 +83,31 @@ cd healthcare-chatbot
 
 ### Backend Setup
 
-`app.py` lives at the repository root and imports `backend.webhook`, so it
-must be run from the repository root - not from inside `backend/`:
+`app.py` lives at the repository root and imports `backend.webhook`, so both
+commands below must be run from the repository root - not from inside `backend/`:
 
 ```bash
 pip install -r backend/requirements.txt
-python app.py
-ngrok http 5000
 ```
+
+**Local development** - Flask's built-in development server, on `http://127.0.0.1:5000`:
+
+```bash
+python app.py
+```
+
+**Production** - [Gunicorn](https://gunicorn.org/) serving the same `app:app` application object:
+
+```bash
+gunicorn --workers 1 --bind 0.0.0.0:${PORT:-5000} app:app
+```
+
+- The server binds to `0.0.0.0` so it is reachable from outside its host or container. If your hosting platform assigns the port through a `PORT` environment variable, it is used; otherwise the port defaults to `5000`.
+- **Run exactly one worker.** Appointments, reminders and in-progress bookings, cancellations and updates are stored in mutable JSON files on the local disk, and separate worker processes would not safely coordinate changes to them. This is an intentional limitation of the current file-based storage, not a recommendation for how the app should scale long-term.
+- Gunicorn does not run on Windows; use `python app.py` for local development there.
+- A deployed frontend must be built with `REACT_APP_API_BASE_URL` pointing at this backend (see Frontend configuration below), and the backend's `CORS_ALLOWED_ORIGINS` must include the deployed frontend's origin (see Configuration).
+
+Ngrok is not needed for either command (see "Technologies Used").
 
 ### Configuration
 
