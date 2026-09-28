@@ -3,6 +3,7 @@ import os
 
 from flask import Flask
 from flask_cors import CORS
+from backend import provider_repository
 from backend.webhook import webhook_bp
 
 # Metadata-only structured logging - see backend/LOGGING_NOTES.md for
@@ -13,6 +14,7 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 # The only local frontend origin this project has ever actually used
 # (frontend/package.json's "start" script is plain `react-scripts start`,
@@ -94,6 +96,24 @@ app.register_blueprint(webhook_bp, url_prefix='/webhook')
 @app.route('/')
 def index():
     return {"message": "Healthcare Chatbot API is running."}
+
+
+# Deployment health check. Loads and validates the provider reference data
+# (providers.json / provider_availability.json) through provider_repository's
+# own loaders - the one failure that leaves the process up while booking is
+# broken. Read-only: it never touches appointments, reminders or pending
+# files, never checks storage durability, and never calls the LLM. The
+# ProviderDataError message holds absolute file paths, so only the
+# exception type is logged and the response carries no details.
+@app.route('/health')
+def health():
+    try:
+        providers = provider_repository.load_providers()
+        provider_repository.load_availability(providers=providers)
+    except provider_repository.ProviderDataError as e:
+        logger.warning("health check failed exception_type=%s", type(e).__name__)
+        return {"status": "unavailable"}, 503
+    return {"status": "ok"}
 
 # Run the app
 if __name__ == '__main__':

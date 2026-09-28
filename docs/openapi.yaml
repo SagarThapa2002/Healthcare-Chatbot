@@ -44,6 +44,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
 
+  /health:
+    get:
+      tags: [Status]
+      operationId: getHealth
+      summary: Deployment health check
+      description: |
+        Loads and validates the provider reference data
+        (`providers.json` and `provider_availability.json`). It does not
+        read or write appointment, reminder or pending-state files, does
+        not check that storage is durable, and does not call the LLM.
+        Failure details are logged by exception type only and never
+        returned.
+      responses:
+        '200':
+          description: Provider reference data loads and validates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+        '503':
+          description: Provider reference data is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: unavailable
+
   /webhook/webhook:
     post:
       tags: [Chatbot]
@@ -186,6 +216,14 @@ components:
         message:
           type: string
           example: Healthcare Chatbot API is running.
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
 
     # ---- Request ----------------------------------------------------------
 

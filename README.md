@@ -104,6 +104,7 @@ gunicorn --workers 1 --bind 0.0.0.0:${PORT:-5000} app:app
 
 - The server binds to `0.0.0.0` so it is reachable from outside its host or container. If your hosting platform assigns the port through a `PORT` environment variable, it is used; otherwise the port defaults to `5000`.
 - **Run exactly one worker.** Appointments, reminders and in-progress bookings, cancellations and updates are stored in mutable JSON files on the local disk, and separate worker processes would not safely coordinate changes to them. This is an intentional limitation of the current file-based storage, not a recommendation for how the app should scale long-term.
+- Point your hosting platform's health check at `GET /health`. It returns `200 {"status": "ok"}` when the provider reference data (`providers.json`, `provider_availability.json`) loads and validates, and `503 {"status": "unavailable"}` otherwise. It does not check that appointment data is being stored durably.
 - Gunicorn does not run on Windows; use `python app.py` for local development there.
 - A deployed frontend must be built with `REACT_APP_API_BASE_URL` pointing at this backend (see Frontend configuration below), and the backend's `CORS_ALLOWED_ORIGINS` must include the deployed frontend's origin (see Configuration).
 
@@ -200,7 +201,7 @@ This subsystem is intentionally scoped and should not be mistaken for a producti
 
 ## 📄 API Contract (OpenAPI)
 
-The HTTP API is documented as an OpenAPI 3.0 specification in [`docs/openapi.yaml`](docs/openapi.yaml). It covers every route the backend registers: `GET /`, `POST /webhook/webhook`, `GET /webhook/appointments`, `GET /webhook/providers` and `GET /webhook/reminders`. For each one it gives the request body, the response envelope (messages, context stages and metadata) and the appointment, provider and reminder record shapes.
+The HTTP API is documented as an OpenAPI 3.0 specification in [`docs/openapi.yaml`](docs/openapi.yaml). It covers every route the backend registers: `GET /`, `GET /health`, `POST /webhook/webhook`, `GET /webhook/appointments`, `GET /webhook/providers` and `GET /webhook/reminders`. For each one it gives the request body, the response envelope (messages, context stages and metadata) and the appointment, provider and reminder record shapes.
 
 The spec describes the implementation **as it exists today**, including its quirks. For example, `POST /webhook/webhook` returns HTTP 200 even for errors (check the `success` field), and the list endpoints return bare JSON arrays. It is a static file, and no Swagger UI or other tooling is bundled. Open it in any OpenAPI viewer or editor.
 
