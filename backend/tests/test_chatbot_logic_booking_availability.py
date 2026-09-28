@@ -1579,5 +1579,106 @@ class BookingSuggestionsTest(BookingFlowTestCase):
         self.assertEqual(cancel["messages"][0]["suggestions"], [])
 
 
+class BookingSuccessProviderDetailsTest(BookingFlowTestCase):
+    """The booking success text names the provider's name, specialty and
+    location, looked up after the appointment is saved. A failed lookup
+    must never turn that saved booking into an error - it falls back to
+    the exact previous wording instead.
+    """
+
+    OLD_WORDING = "Your appointment for Test Patient on 2026-12-28 at 10:00 has been booked."
+
+    def _reach_confirm(self, provider_id="dr-patel", date="2026-12-28", time="10:00"):
+        confirm = self.post_webhook(
+            "Book Appointment",
+            {"name": "Test Patient", "providerId": provider_id, "date": date, "time": time},
+        ).get_json()
+        self.assertEqual(confirm["context"]["bookingStage"], "confirm")
+
+    def _book(self, **kwargs):
+        self._reach_confirm(**kwargs)
+        return self.post_webhook("YesIntent").get_json()
+
+    def _saved(self):
+        with open(self.appointments_file) as f:
+            return json.load(f)
+
+    def _patch_success_lookup(self, **fake):
+        """Fakes find_provider() only for the success-text lookup.
+
+        availability_service.is_slot_available() also calls
+        provider_repository.find_provider() during the final re-check (with
+        an explicit `providers=` argument), so patching it outright would
+        break the re-check before anything is saved. Calls that pass
+        `providers=` keep using the real function. Applied only around the
+        YesIntent request, so earlier booking steps are unaffected.
+        """
+        real = provider_repository.find_provider
+
+        def selective(provider_id, providers=None):
+            if providers is not None:
+                return real(provider_id, providers=providers)
+            if "side_effect" in fake:
+                raise fake["side_effect"]
+            return fake["return_value"]
+
+        return patch.object(provider_repository, 'find_provider', side_effect=selective)
+
+    def test_success_text_includes_dr_patel_name_specialty_and_location(self):
+        booked = self._book()
+        self.assertEqual(booked["context"]["bookingStage"], "booked")
+        self.assertEqual(
+            booked["messages"][0]["content"]["text"],
+            "Your appointment with Dr. Patel (General Practice, Main Clinic) for Test Patient "
+            "on 2026-12-28 at 10:00 has been booked.",
+        )
+
+    def test_success_text_uses_the_booked_providers_own_details(self):
+        # dr-nguyen: Tuesday 10:00-15:00 (see backend/provider_availability.json).
+        booked = self._book(provider_id="dr-nguyen", date="2026-12-29", time="10:00")
+        self.assertEqual(
+            booked["messages"][0]["content"]["text"],
+            "Your appointment with Dr. Nguyen (Pediatrics, Main Clinic) for Test Patient "
+            "on 2026-12-29 at 10:00 has been booked.",
+        )
+
+    def test_unknown_provider_lookup_falls_back_to_previous_wording(self):
+        self._reach_confirm()
+        with self._patch_success_lookup(return_value=None):
+            booked = self.post_webhook("YesIntent").get_json()
+
+        self.assertTrue(booked["success"])
+        self.assertEqual(booked["context"]["bookingStage"], "booked")
+        self.assertEqual(booked["messages"][0]["type"], "booking_confirmation")
+        self.assertEqual(booked["messages"][0]["content"]["text"], self.OLD_WORDING)
+        self.assertEqual(len(self._saved()), 1)
+
+    def test_provider_data_error_falls_back_to_previous_wording_and_keeps_the_booking(self):
+        self._reach_confirm()
+        with self._patch_success_lookup(side_effect=provider_repository.ProviderDataError("corrupt")):
+            booked = self.post_webhook("YesIntent").get_json()
+
+        self.assertTrue(booked["success"])
+        self.assertIsNone(booked["error"])
+        self.assertEqual(booked["context"]["bookingStage"], "booked")
+        self.assertEqual(booked["messages"][0]["content"]["text"], self.OLD_WORDING)
+
+        saved = self._saved()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], booked["messages"][0]["content"]["appointment"]["id"])
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_content_appointment_is_unchanged(self):
+        booked = self._book()
+        appointment = booked["messages"][0]["content"]["appointment"]
+        self.assertEqual(set(appointment), {"id", "name", "providerId", "date", "time"})
+        self.assertEqual(appointment["providerId"], "dr-patel")
+        self.assertEqual(appointment, self._saved()[0])
+
+    def test_success_message_has_no_suggestions(self):
+        booked = self._book()
+        self.assertEqual(booked["messages"][0]["suggestions"], [])
+
+
 if __name__ == '__main__':
     unittest.main()

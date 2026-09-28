@@ -698,11 +698,38 @@ def _handle_yes_intent():
         _schedule_reminder_for_booking(appointment)
         os.remove(PENDING_FILE)
 
-        text = f"Your appointment for {appointment['name']} on {appointment['date']} at {appointment['time']} has been booked."
+        provider_phrase = _booked_provider_phrase(appointment['providerId'])
+        text = (
+            f"Your appointment{provider_phrase} for {appointment['name']} on {appointment['date']} "
+            f"at {appointment['time']} has been booked."
+        )
         return [response_model.booking_confirmation_message(text, appointment)], "booked"
 
     text = "There is no appointment pending confirmation."
     return [response_model.text_message(text)], None
+
+
+def _booked_provider_phrase(provider_id):
+    """Returns e.g. ' with Dr. Patel (General Practice, Main Clinic)' for
+    the booking success text, read through provider_repository.find_provider().
+
+    Called only after the appointment has already been saved, so it must
+    never turn a successful booking into an error: an unknown id (None)
+    or unreadable provider data (ProviderDataError) returns "" instead,
+    which leaves the success text exactly as it was before provider
+    details were added.
+    """
+    try:
+        provider = provider_repository.find_provider(provider_id)
+    except provider_repository.ProviderDataError as e:
+        logger.warning(
+            "booking success provider lookup failed provider_id=%s exception_type=%s",
+            provider_id, type(e).__name__,
+        )
+        return ""
+    if provider is None:
+        return ""
+    return f" with {provider['name']} ({provider['specialty']}, {provider['location']})"
 
 
 def _schedule_reminder_for_booking(appointment):
