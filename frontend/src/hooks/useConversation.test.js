@@ -892,4 +892,62 @@ describe('backend-provided appointment suggestion chips (rendered Chatbot)', () 
     );
     expect(callBackend).toHaveBeenCalledTimes(4);
   });
+
+  // Booking confirmation Yes/No chips: the chip values are the same bare
+  // "yes"/"no" a user could type, so they reach the existing confirm-stage
+  // routing (YesIntent/NoIntent with no parameters - the backend reads the
+  // pending booking itself). Drives name -> provider -> date -> slot by
+  // typing, then clicks the chip the backend attached to the confirm prompt.
+  const YES_NO = [
+    { id: 'yes', label: 'Yes', value: 'yes' },
+    { id: 'no', label: 'No', value: 'no' },
+  ];
+
+  async function renderAtBookingConfirm() {
+    const typeAndSubmit = async (value) => {
+      await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+      fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+      fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    };
+    render(<Chatbot />);
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await typeAndSubmit('book an appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Which provider would you like to see?', 'provider'));
+    await typeAndSubmit('Sagar');
+    callBackend.mockResolvedValueOnce(envelopeWithText('What date would you like to see Dr. Patel?', 'date'));
+    await typeAndSubmit('dr-patel');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-28:', 'slot'));
+    await typeAndSubmit('2026-12-28');
+
+    const confirmText = 'Please confirm — book appointment with Dr. Patel for Sagar on 2026-12-28 at 10:00? (yes or no)';
+    callBackend.mockResolvedValueOnce({
+      ...envelopeWithText(confirmText, 'confirm'),
+      messages: [{ type: 'text', content: { text: confirmText }, suggestions: YES_NO }],
+    });
+    await typeAndSubmit('10:00');
+    await waitFor(() =>
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:00' }
+      )
+    );
+  }
+
+  test('clicking the Yes chip at booking confirmation sends the existing YesIntent', async () => {
+    await renderAtBookingConfirm();
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Your appointment has been booked.', 'booked'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Yes' }));
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {}));
+    expect(callBackend).toHaveBeenCalledTimes(6);
+  });
+
+  test('clicking the No chip at booking confirmation sends the existing NoIntent', async () => {
+    await renderAtBookingConfirm();
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('No problem! Appointment booking has been canceled.'));
+    fireEvent.click(await screen.findByRole('button', { name: 'No' }));
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {}));
+    expect(callBackend).toHaveBeenCalledTimes(6);
+  });
 });

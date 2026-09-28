@@ -304,6 +304,19 @@ def _slot_suggestions(slots):
     return [{"id": slot, "label": slot, "value": slot} for slot in slots]
 
 
+def _booking_confirm_suggestions():
+    """Yes/No suggestions for the booking confirmation prompt. The values
+    are exactly the bare "yes"/"no" replies a user could already type -
+    the frontend routes them to YesIntent/NoIntent unchanged, so the
+    final availability re-check in _handle_yes_intent stays authoritative.
+    Built fresh on every call so no caller can mutate a shared list.
+    """
+    return [
+        {"id": "yes", "label": "Yes", "value": "yes"},
+        {"id": "no", "label": "No", "value": "no"},
+    ]
+
+
 _WEEKDAY_ORDER = (
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
 )
@@ -600,7 +613,7 @@ def _handle_book_appointment(parameters):
         f"{date} at {resolved_time}? (yes or no)"
     )
 
-    return [response_model.text_message(text)], "confirm"
+    return [response_model.text_message(text, suggestions=_booking_confirm_suggestions())], "confirm"
 
 
 def _handle_yes_intent():

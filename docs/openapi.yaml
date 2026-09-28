@@ -385,6 +385,10 @@ components:
           unavailable time. One suggestion per currently available slot,
           in the same order as the numbered list in the text. Empty when no
           slots remain.
+        - Book Appointment, asking the user to confirm the booking
+          (`bookingStage` = `confirm`). Exactly two suggestions, `yes` and
+          `no`. Update and Cancel Appointment confirmation prompts carry no
+          suggestions.
       items:
         $ref: '#/components/schemas/Suggestion'
 
@@ -392,15 +396,16 @@ components:
       type: object
       required: [id, label, value]
       description: |
-        `value` is always a canonical value the backend validates again
-        when it is sent back - never a list number.
+        `value` is always a canonical value the user could also type - never
+        a list number - and the backend stays authoritative for whatever it
+        selects.
       properties:
         id:
           type: string
           description: |
             Identifies what the suggestion selects: the candidate
-            appointment's id, the provider's id, or the slot's HH:MM start
-            time.
+            appointment's id, the provider's id, the slot's HH:MM start
+            time, or `yes`/`no` for a booking confirmation.
         label:
           type: string
           description: Human-readable text for the chip.
@@ -410,7 +415,9 @@ components:
           description: |
             The value to send back (currently identical to `id`): as
             `parameters.id` for an appointment, as `parameters.providerId`
-            for a provider, or as `parameters.time` for a slot.
+            for a provider, or as `parameters.time` for a slot. A booking
+            confirmation's `yes`/`no` is sent as the `YesIntent`/`NoIntent`
+            intent with empty parameters, exactly like a typed reply.
 
     TextMessage:
       type: object

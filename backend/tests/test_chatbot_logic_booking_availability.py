@@ -1498,14 +1498,85 @@ class BookingSuggestionsTest(BookingFlowTestCase):
     def test_slot_suggestions_are_empty_when_no_slots_remain(self):
         self.assertEqual(chatbot_logic._slot_suggestions([]), [])
 
-    def test_confirm_stage_and_booked_confirmation_have_no_suggestions(self):
+    def test_confirm_stage_has_yes_no_suggestions_and_booked_confirmation_has_none(self):
         response = self.post_webhook("Book Appointment", {**self.PROMPT_PARAMS, "time": "10:00"})
         self.assertEqual(self._stage(response), "confirm")
-        self.assertEqual(self._suggestions(response), [])
+        self.assertEqual(self._suggestions(response), self.YES_NO)
 
         booked = self.post_webhook("YesIntent")
         self.assertEqual(self._stage(booked), "booked")
         self.assertEqual(self._suggestions(booked), [])
+
+    # --- booking confirmation Yes/No suggestions ---
+
+    YES_NO = [
+        {"id": "yes", "label": "Yes", "value": "yes"},
+        {"id": "no", "label": "No", "value": "no"},
+    ]
+
+    def _reach_confirm(self, time="10:00"):
+        return self.post_webhook("Book Appointment", {**self.PROMPT_PARAMS, "time": time})
+
+    def test_confirm_suggestions_are_exactly_yes_and_no(self):
+        suggestions = self._suggestions(self._reach_confirm())
+        self.assertEqual([s["id"] for s in suggestions], ["yes", "no"])
+        self.assertEqual([s["label"] for s in suggestions], ["Yes", "No"])
+        self.assertEqual([s["value"] for s in suggestions], ["yes", "no"])
+
+    def test_confirm_text_is_unchanged(self):
+        self.assertEqual(
+            self._message(self._reach_confirm())["content"]["text"],
+            "Please confirm — book appointment with Dr. Patel for Test Patient on 2026-12-28 at 10:00? (yes or no)",
+        )
+
+    def test_confirm_suggestions_are_a_fresh_list_each_call(self):
+        first = chatbot_logic._booking_confirm_suggestions()
+        first[0]["value"] = "mutated"
+        self.assertEqual(chatbot_logic._booking_confirm_suggestions(), self.YES_NO)
+
+    def test_yes_after_confirm_suggestions_still_books_the_appointment(self):
+        self._reach_confirm()
+        booked = self.post_webhook("YesIntent")
+        self.assertEqual(self._stage(booked), "booked")
+        self.assertEqual(self._message(booked)["type"], "booking_confirmation")
+        self.assertFalse(os.path.exists(self.pending_file))
+        with open(self.appointments_file) as f:
+            saved = json.load(f)
+        self.assertEqual([(a["providerId"], a["date"], a["time"]) for a in saved], [("dr-patel", "2026-12-28", "10:00")])
+
+    def test_no_after_confirm_suggestions_still_discards_the_pending_booking(self):
+        self._reach_confirm()
+        declined = self.post_webhook("NoIntent")
+        self.assertIn("Appointment booking has been canceled", self._message(declined)["content"]["text"])
+        self.assertIsNone(self._stage(declined))
+        self.assertEqual(self._suggestions(declined), [])
+        self.assertFalse(os.path.exists(self.pending_file))
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_final_availability_recheck_still_rejects_a_slot_taken_before_yes(self):
+        self._reach_confirm()
+        self._book("Someone Else", "10:00")
+
+        rejected = self.post_webhook("YesIntent")
+        self.assertIsNone(self._stage(rejected))
+        self.assertIn("no longer available", self._message(rejected)["content"]["text"])
+        self.assertEqual(self._suggestions(rejected), [])
+        self.assertTrue(os.path.exists(self.pending_file))
+
+    def test_cancel_and_update_confirm_prompts_do_not_gain_yes_no_suggestions(self):
+        self._reach_confirm()
+        appointment_id = self._message(self.post_webhook("YesIntent"))["content"]["appointment"]["id"]
+
+        update = self.post_webhook(
+            "Update Appointment", {"id": appointment_id, "date": "2026-12-30", "time": "11:00"}
+        ).get_json()
+        self.assertEqual(update["context"]["updateStage"], "confirm")
+        self.assertEqual(update["messages"][0]["suggestions"], [])
+        self.post_webhook("NoIntent")
+
+        cancel = self.post_webhook("Cancel Appointment", {"id": appointment_id}).get_json()
+        self.assertEqual(cancel["context"]["cancellationStage"], "confirm")
+        self.assertEqual(cancel["messages"][0]["suggestions"], [])
 
 
 if __name__ == '__main__':
