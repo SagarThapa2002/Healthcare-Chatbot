@@ -844,4 +844,52 @@ describe('backend-provided appointment suggestion chips (rendered Chatbot)', () 
     // The chips belonged to the previous bot message, so they are gone now.
     await waitFor(() => expect(screen.queryByRole('button', { name: '2026-12-28 at 09:00' })).not.toBeInTheDocument());
   });
+
+  test('clicking a provider chip sends its provider id through the existing provider-stage routing and advances to date', async () => {
+    const providers = [
+      { id: 'dr-patel', label: 'Dr. Patel - General Practice', value: 'dr-patel' },
+      { id: 'dr-nguyen', label: 'Dr. Nguyen - Pediatrics', value: 'dr-nguyen' },
+    ];
+    const typeAndSubmit = async (value) => {
+      await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+      fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+      fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    };
+    render(<Chatbot />);
+
+    // 1. Start booking -> backend asks for a name.
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name for the appointment?', 'name'));
+    await typeAndSubmit('book an appointment');
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', {}));
+
+    // 2. Name -> backend asks for a provider and attaches one chip per provider.
+    callBackend.mockResolvedValueOnce({
+      ...envelopeWithText('Thanks Sagar. Which provider would you like to see?', 'provider'),
+      messages: [{
+        type: 'text',
+        content: { text: 'Thanks Sagar. Which provider would you like to see?' },
+        suggestions: providers,
+      }],
+    });
+    await typeAndSubmit('Sagar');
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar' }));
+
+    // 3. Click the second chip -> its value goes out as providerId.
+    callBackend.mockResolvedValueOnce(envelopeWithText('What date would you like to see Dr. Nguyen? (YYYY-MM-DD)', 'date'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Dr. Nguyen - Pediatrics' }));
+    await waitFor(() =>
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar', providerId: 'dr-nguyen' })
+    );
+
+    // 4. The backend accepted it (bookingStage "date"), so the next reply is
+    // parsed as a date and sent alongside the chip's provider id.
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-29:', 'slot'));
+    await typeAndSubmit('2026-12-29');
+    await waitFor(() =>
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-nguyen', date: '2026-12-29' }
+      )
+    );
+    expect(callBackend).toHaveBeenCalledTimes(4);
+  });
 });

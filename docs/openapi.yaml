@@ -370,26 +370,47 @@ components:
     Suggestions:
       type: array
       description: |
-        Always present, usually empty. It is non-empty only on the `text`
-        message that asks the user to pick one of several matching
-        appointments during Update or Cancel Appointment
-        (`updateStage`/`cancellationStage` = `identifier`).
+        Always present, usually empty. It is non-empty only on these `text`
+        messages:
+
+        - Update or Cancel Appointment, asking the user to pick one of
+          several matching appointments (`updateStage`/`cancellationStage`
+          = `identifier`). One suggestion per candidate appointment.
+        - Book Appointment, asking the user to pick a provider
+          (`bookingStage` = `provider`), including the re-prompt after an
+          unrecognized provider. One suggestion per provider, in the same
+          order as the numbered list in the text.
+        - Book Appointment, asking the user to pick a time
+          (`bookingStage` = `slot`), including the re-prompt after an
+          unavailable time. One suggestion per currently available slot,
+          in the same order as the numbered list in the text. Empty when no
+          slots remain.
       items:
         $ref: '#/components/schemas/Suggestion'
 
     Suggestion:
       type: object
       required: [id, label, value]
+      description: |
+        `value` is always a canonical value the backend validates again
+        when it is sent back - never a list number.
       properties:
         id:
           type: string
-          description: The candidate appointment's id.
+          description: |
+            Identifies what the suggestion selects: the candidate
+            appointment's id, the provider's id, or the slot's HH:MM start
+            time.
         label:
           type: string
+          description: Human-readable text for the chip.
           example: 2026-10-05 at 09:30
         value:
           type: string
-          description: The value to send back as `parameters.id` (currently identical to `id`).
+          description: |
+            The value to send back (currently identical to `id`): as
+            `parameters.id` for an appointment, as `parameters.providerId`
+            for a provider, or as `parameters.time` for a slot.
 
     TextMessage:
       type: object

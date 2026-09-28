@@ -198,7 +198,7 @@ def _handle_symptom_check(parameters):
     return [response_model.text_message(text)]
 
 
-def _format_provider_list():
+def _format_provider_list(providers=None):
     """Deterministic, human-readable numbered list of every known provider.
 
     Called from _handle_book_appointment() as part of the NAME -> PROVIDER
@@ -218,8 +218,13 @@ def _format_provider_list():
     re-sorted here, so a future caller can safely interpret a numeric
     reply like "2" as the second entry without this function and a later
     re-read ever disagreeing on order.
+
+    `providers`, if given, is used instead of reading the repository -
+    lets _handle_book_appointment build this text and its matching
+    _provider_suggestions() from one single read.
     """
-    providers = provider_repository.list_providers()
+    if providers is None:
+        providers = provider_repository.list_providers()
     if not providers:
         return "No providers are currently configured."
 
@@ -230,7 +235,7 @@ def _format_provider_list():
     return "\n".join(lines)
 
 
-def _format_slot_list(provider_id, date):
+def _format_slot_list(provider_id, date, slots=None):
     """Deterministic, human-readable numbered list of a provider's
     available start times on one date.
 
@@ -261,13 +266,42 @@ def _format_slot_list(provider_id, date):
     malformed date) - not caught or reinterpreted here. Handling that is
     the responsibility of _handle_book_appointment, which calls this as
     part of the booking flow.
+
+    `slots`, if given, is used instead of calling get_available_slots() -
+    lets _handle_book_appointment build this text and its matching
+    _slot_suggestions() from one single availability read, so the list
+    and the chips can never disagree.
     """
-    slots = availability_service.get_available_slots(provider_id, date)
+    if slots is None:
+        slots = availability_service.get_available_slots(provider_id, date)
     if not slots:
         return "No available slots for that date."
 
     lines = [f"{index}. {slot}" for index, slot in enumerate(slots, start=1)]
     return "\n".join(lines)
+
+
+def _provider_suggestions(providers):
+    """One {id, label, value} suggestion per provider, in the given
+    (repository file) order - the same order _format_provider_list()
+    numbers them in. `value` is the canonical provider id, which
+    _resolve_provider_choice() accepts as an exact match, so a clicked
+    chip goes back through the exact same validation as typed input.
+    """
+    return [
+        {"id": p["id"], "label": f"{p['name']} - {p['specialty']}", "value": p["id"]}
+        for p in providers
+    ]
+
+
+def _slot_suggestions(slots):
+    """One {id, label, value} suggestion per available slot, in
+    get_available_slots() order. `value` is the exact HH:MM start time -
+    never a list number - so _resolve_slot_choice() re-checks that exact
+    time's availability, and a chip from an outdated list can't silently
+    select a different slot.
+    """
+    return [{"id": slot, "label": slot, "value": slot} for slot in slots]
 
 
 _WEEKDAY_ORDER = (
@@ -479,16 +513,20 @@ def _handle_book_appointment(parameters):
         return [response_model.text_message(text)], "name"
 
     if not provider_choice:
-        text = f"Thanks {name}. Which provider would you like to see?\n{_format_provider_list()}"
-        return [response_model.text_message(text)], "provider"
+        providers = provider_repository.list_providers()
+        text = f"Thanks {name}. Which provider would you like to see?\n{_format_provider_list(providers)}"
+        suggestions = _provider_suggestions(providers)
+        return [response_model.text_message(text, suggestions=suggestions)], "provider"
 
     provider_id = _resolve_provider_choice(provider_choice)
     if provider_id is None:
+        providers = provider_repository.list_providers()
         text = (
             "Sorry, I didn't recognize that provider. Please choose one from the list:\n"
-            f"{_format_provider_list()}"
+            f"{_format_provider_list(providers)}"
         )
-        return [response_model.text_message(text)], "provider"
+        suggestions = _provider_suggestions(providers)
+        return [response_model.text_message(text, suggestions=suggestions)], "provider"
 
     if not date:
         provider = provider_repository.find_provider(provider_id)
@@ -529,8 +567,10 @@ def _handle_book_appointment(parameters):
 
     # status == _DATE_HAS_SLOTS
     if not slot_choice:
-        text = f"Here are the available times on {date}:\n{_format_slot_list(provider_id, date)}"
-        return [response_model.text_message(text)], "slot"
+        slots = availability_service.get_available_slots(provider_id, date)
+        text = f"Here are the available times on {date}:\n{_format_slot_list(provider_id, date, slots)}"
+        suggestions = _slot_suggestions(slots)
+        return [response_model.text_message(text, suggestions=suggestions)], "slot"
 
     # _resolve_slot_choice never raises - any AvailabilityError it hits
     # (a malformed choice, or a data problem) is already turned into a
@@ -539,11 +579,13 @@ def _handle_book_appointment(parameters):
     resolved_time = _resolve_slot_choice(slot_choice, provider_id, date)
 
     if resolved_time is None:
+        slots = availability_service.get_available_slots(provider_id, date)
         text = (
             "Sorry, that time isn't available anymore. Here are the current options:\n"
-            f"{_format_slot_list(provider_id, date)}"
+            f"{_format_slot_list(provider_id, date, slots)}"
         )
-        return [response_model.text_message(text)], "slot"
+        suggestions = _slot_suggestions(slots)
+        return [response_model.text_message(text, suggestions=suggestions)], "slot"
 
     pending = {
         "name": name,

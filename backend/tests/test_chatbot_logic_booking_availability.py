@@ -1007,6 +1007,22 @@ class CancellationFlowTest(BookingFlowTestCase):
         self.assertIn(first["id"], suggestion_values)
         self.assertIn(second["id"], suggestion_values)
 
+    def test_update_duplicate_name_disambiguation_suggestions_are_appointment_ids(self):
+        # Regression guard: booking-flow provider/slot chips must not
+        # change the existing update-flow disambiguation suggestions.
+        first = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:00")
+        second = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:30")
+
+        response = self.post_webhook("Update Appointment", {"name": "Dup Patient"}).get_json()
+        self.assertEqual(response["context"]["updateStage"], "identifier")
+        self.assertEqual(
+            response["messages"][0]["suggestions"],
+            [
+                {"id": first["id"], "label": "2026-12-28 at 10:00", "value": first["id"]},
+                {"id": second["id"], "label": "2026-12-28 at 10:30", "value": second["id"]},
+            ],
+        )
+
     def test_duplicate_name_with_one_legacy_record_does_not_offer_id_disambiguation(self):
         self._book_and_confirm(name="Mixed Patient", date="2026-12-28", time="10:00")
         saved = self._read_appointments()
@@ -1304,6 +1320,192 @@ class BookingPendingTransactionMutualExclusionTest(BookingFlowTestCase):
         saved = self._read_appointments()
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["name"], "Solo")
+
+
+class BookingSuggestionsTest(BookingFlowTestCase):
+    """Provider- and slot-stage suggestion chips. Every chip `value` must
+    be a canonical value the backend's own resolvers already accept (a
+    provider id, an exact HH:MM time - never a list number), so a clicked
+    chip goes through exactly the same validation as typed input.
+    """
+
+    PROMPT_PARAMS = {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+
+    def _message(self, response):
+        return response.get_json()["messages"][0]
+
+    def _suggestions(self, response):
+        return self._message(response)["suggestions"]
+
+    def _stage(self, response):
+        return response.get_json()["context"].get("bookingStage")
+
+    def _book(self, name, time):
+        with open(self.appointments_file, 'w') as f:
+            json.dump(
+                [{"name": name, "providerId": "dr-patel", "date": "2026-12-28", "time": time, "status": "booked"}],
+                f,
+            )
+
+    # --- provider stage ---
+
+    def test_provider_prompt_has_one_suggestion_per_provider_in_repository_order(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        self.assertEqual(self._stage(response), "provider")
+        self.assertEqual(
+            self._suggestions(response),
+            [
+                {"id": "dr-patel", "label": "Dr. Patel - General Practice", "value": "dr-patel"},
+                {"id": "dr-nguyen", "label": "Dr. Nguyen - Pediatrics", "value": "dr-nguyen"},
+                {"id": "dr-okafor", "label": "Dr. Okafor - Dermatology", "value": "dr-okafor"},
+            ],
+        )
+
+    def test_provider_prompt_text_list_is_unchanged(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        self.assertEqual(
+            self._message(response)["content"]["text"],
+            f"Thanks Test Patient. Which provider would you like to see?\n{_format_provider_list()}",
+        )
+
+    def test_provider_suggestion_values_resolve_to_their_own_provider_id(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        suggestions = self._suggestions(response)
+        self.assertEqual(len(suggestions), len(provider_repository.list_providers()))
+        for suggestion in suggestions:
+            self.assertEqual(chatbot_logic._resolve_provider_choice(suggestion["value"]), suggestion["id"])
+
+    def test_provider_reprompt_after_invalid_choice_also_has_suggestions(self):
+        first = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "Not A Real Doctor"}
+        )
+        self.assertEqual(self._stage(response), "provider")
+        self.assertIn("didn't recognize", self._message(response)["content"]["text"])
+        self.assertEqual(len(self._suggestions(response)), 3)
+        self.assertEqual(self._suggestions(response), self._suggestions(first))
+
+    def test_selecting_a_provider_chip_value_advances_to_date_stage(self):
+        prompt = self.post_webhook("Book Appointment", {"name": "Test Patient"})
+        chip = self._suggestions(prompt)[1]
+
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": chip["value"]})
+        self.assertEqual(self._stage(response), "date")
+        self.assertIn("Dr. Nguyen", self._message(response)["content"]["text"])
+
+    def test_provider_suggestions_are_built_from_repository_data_in_its_order(self):
+        providers = [
+            make_provider(provider_id="dr-z", name="Dr. Z", specialty="Zoology"),
+            make_provider(provider_id="dr-a", name="Dr. A", specialty="Anatomy"),
+        ]
+        before = copy.deepcopy(providers)
+        self.assertEqual(
+            chatbot_logic._provider_suggestions(providers),
+            [
+                {"id": "dr-z", "label": "Dr. Z - Zoology", "value": "dr-z"},
+                {"id": "dr-a", "label": "Dr. A - Anatomy", "value": "dr-a"},
+            ],
+        )
+        self.assertEqual(providers, before)
+
+    # --- slot stage ---
+
+    def test_slot_prompt_suggestions_are_exactly_the_available_slots_in_order(self):
+        response = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        self.assertEqual(self._stage(response), "slot")
+
+        expected = availability_service.get_available_slots("dr-patel", "2026-12-28")
+        self.assertEqual(
+            self._suggestions(response),
+            [{"id": slot, "label": slot, "value": slot} for slot in expected],
+        )
+        values = [s["value"] for s in self._suggestions(response)]
+        self.assertEqual(values[0], "09:00")
+        self.assertEqual(values[-1], "16:30")
+
+    def test_slot_suggestion_values_are_exact_hh_mm_times_not_list_numbers(self):
+        response = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        self.assertTrue(self._suggestions(response))
+        for suggestion in self._suggestions(response):
+            self.assertRegex(suggestion["value"], r"^\d{2}:\d{2}$")
+
+    def test_slot_prompt_text_list_is_unchanged(self):
+        response = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        self.assertEqual(
+            self._message(response)["content"]["text"],
+            f"Here are the available times on 2026-12-28:\n{_format_slot_list('dr-patel', '2026-12-28')}",
+        )
+
+    def test_booked_slot_is_excluded_from_slot_suggestions(self):
+        self._book("Someone Else", "10:00")
+        response = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        values = [s["value"] for s in self._suggestions(response)]
+        self.assertNotIn("10:00", values)
+        self.assertIn("09:30", values)
+        self.assertIn("10:30", values)
+
+    def test_slot_reprompt_has_the_current_available_suggestions(self):
+        self._book("Someone Else", "10:00")
+        response = self.post_webhook("Book Appointment", {**self.PROMPT_PARAMS, "time": "10:00"})
+        self.assertEqual(self._stage(response), "slot")
+        self.assertIn("isn't available anymore", self._message(response)["content"]["text"])
+
+        expected = availability_service.get_available_slots("dr-patel", "2026-12-28")
+        self.assertNotIn("10:00", expected)
+        self.assertEqual([s["value"] for s in self._suggestions(response)], expected)
+
+    def test_selecting_a_slot_chip_value_advances_to_confirm_stage(self):
+        prompt = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        chip = self._suggestions(prompt)[2]
+
+        response = self.post_webhook("Book Appointment", {**self.PROMPT_PARAMS, "time": chip["value"]})
+        self.assertEqual(self._stage(response), "confirm")
+        self.assertIn(chip["value"], self._message(response)["content"]["text"])
+        self.assertTrue(os.path.exists(self.pending_file))
+
+    def test_format_slot_list_uses_given_slots_without_reading_availability(self):
+        with patch.object(availability_service, 'get_available_slots') as mock_get:
+            result = _format_slot_list("dr-a", "2026-09-21", ["09:00", "09:30"])
+        mock_get.assert_not_called()
+        self.assertEqual(result, "1. 09:00\n2. 09:30")
+
+    # --- stages that must not gain suggestions ---
+
+    def test_name_stage_has_no_suggestions(self):
+        response = self.post_webhook("Book Appointment", {})
+        self.assertEqual(self._stage(response), "name")
+        self.assertEqual(self._suggestions(response), [])
+
+    def test_date_stage_has_no_suggestions(self):
+        response = self.post_webhook("Book Appointment", {"name": "Test Patient", "providerId": "dr-patel"})
+        self.assertEqual(self._stage(response), "date")
+        self.assertEqual(self._suggestions(response), [])
+
+    def test_no_weekday_availability_path_has_no_suggestions(self):
+        # dr-patel has no Tuesday availability.
+        response = self.post_webhook(
+            "Book Appointment", {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-29"}
+        )
+        self.assertEqual(self._stage(response), "date")
+        self.assertEqual(self._suggestions(response), [])
+
+    def test_fully_booked_path_has_no_slot_suggestions(self):
+        self._fill_every_slot("dr-patel", "2026-12-28")
+        response = self.post_webhook("Book Appointment", self.PROMPT_PARAMS)
+        self.assertEqual(self._stage(response), "date")
+        self.assertEqual(self._suggestions(response), [])
+
+    def test_slot_suggestions_are_empty_when_no_slots_remain(self):
+        self.assertEqual(chatbot_logic._slot_suggestions([]), [])
+
+    def test_confirm_stage_and_booked_confirmation_have_no_suggestions(self):
+        response = self.post_webhook("Book Appointment", {**self.PROMPT_PARAMS, "time": "10:00"})
+        self.assertEqual(self._stage(response), "confirm")
+        self.assertEqual(self._suggestions(response), [])
+
+        booked = self.post_webhook("YesIntent")
+        self.assertEqual(self._stage(booked), "booked")
+        self.assertEqual(self._suggestions(booked), [])
 
 
 if __name__ == '__main__':
