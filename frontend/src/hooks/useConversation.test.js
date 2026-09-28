@@ -1,5 +1,6 @@
-import { act, renderHook } from '@testing-library/react';
+import { act, renderHook, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { useConversation } from './useConversation';
+import Chatbot from '../components/Chatbot';
 import { callBackend } from '../api/client';
 
 // Only the payload construction is under test here - callBackend itself
@@ -790,5 +791,57 @@ describe('update flow (Phase 6.1 Slice B - frontend, context.updateStage only)',
     callBackend.mockResolvedValueOnce(envelopeWithUpdate('What would you like to change?', 'fields'));
     await submitMessage(result, 'Sagar');
     expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar' });
+  });
+});
+
+// Regression for backend-provided suggestion chips: renders the real
+// Chatbot (real ChatPanel + real useConversation, with only callBackend
+// mocked) so the test goes through an actual chip click rather than
+// calling sendMessage directly. Production useConversation.js is unchanged
+// - this only proves the existing identifier-stage `{ id }` routing is
+// what a chip click reaches.
+describe('backend-provided appointment suggestion chips (rendered Chatbot)', () => {
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  test('clicking a disambiguation chip sends that appointment as `{ id }` through the existing cancellation routing', async () => {
+    const candidates = [
+      { id: 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d', label: '2026-12-28 at 09:00', value: 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d' },
+      { id: 'c4a3d0b1-2f3e-4c4b-8d2e-9f8a7b6c5d4e', label: '2026-12-30 at 14:00', value: 'c4a3d0b1-2f3e-4c4b-8d2e-9f8a7b6c5d4e' },
+    ];
+    render(<Chatbot />);
+
+    // 1. Start cancellation -> backend asks for an identifier.
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("What's the ID or name on the appointment?", 'identifier'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'cancel my appointment' } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', {}));
+
+    // 2. Reply with a name that matches several appointments -> backend
+    // stays at "identifier" and attaches one suggestion per candidate.
+    callBackend.mockResolvedValueOnce({
+      ...envelopeWithCancellation('I found multiple appointments for Sagar. Please tell me the appointment ID:', 'identifier'),
+      messages: [{
+        type: 'text',
+        content: { text: 'I found multiple appointments for Sagar. Please tell me the appointment ID:' },
+        suggestions: candidates,
+      }],
+    });
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Sagar' } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' }));
+
+    // 3. Click the second chip -> its value goes out as `{ id }`.
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm - cancel it? (yes or no)', 'confirm'));
+    fireEvent.click(await screen.findByRole('button', { name: '2026-12-30 at 14:00' }));
+    await waitFor(() =>
+      expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { id: candidates[1].value })
+    );
+    expect(callBackend).toHaveBeenCalledTimes(3);
+
+    // The chips belonged to the previous bot message, so they are gone now.
+    await waitFor(() => expect(screen.queryByRole('button', { name: '2026-12-28 at 09:00' })).not.toBeInTheDocument());
   });
 });

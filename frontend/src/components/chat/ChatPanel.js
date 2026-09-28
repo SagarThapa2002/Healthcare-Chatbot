@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import MessageList from './MessageList';
 import { getMessageText } from './MessageBubble';
 import EmptyState from './EmptyState';
+import SuggestionChips from './SuggestionChips';
 import TypingIndicator from './TypingIndicator';
 import ChatComposer from './ChatComposer';
 import ErrorBanner from './ErrorBanner';
@@ -44,6 +45,17 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
     setUserInput(value);
   };
 
+  // Backend-provided suggestions (e.g. one {id, label, value} per candidate
+  // appointment during update/cancel disambiguation) are shown only for the
+  // latest message, and only if that message is the bot's. Once the user
+  // replies, their message becomes the latest one, so older chips disappear
+  // and a stale value can never be sent out of context.
+  const latestMessage = messages[messages.length - 1];
+  const latestSuggestions =
+    latestMessage?.sender === 'bot' && Array.isArray(latestMessage.suggestions)
+      ? latestMessage.suggestions
+      : [];
+
   const latestAssistantText = (() => {
     if (isTyping) return '';
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -63,6 +75,15 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
           <EmptyState onSuggestionSelect={handleSuggestionSelect} disabled={isTyping} />
         ) : (
           <MessageList messages={messages} />
+        )}
+        {latestSuggestions.length > 0 && (
+          <div className="mt-3">
+            <SuggestionChips
+              suggestions={latestSuggestions}
+              onSelect={handleSuggestionSelect}
+              disabled={isTyping}
+            />
+          </div>
         )}
         {isTyping && (
           <div className="mt-3">
