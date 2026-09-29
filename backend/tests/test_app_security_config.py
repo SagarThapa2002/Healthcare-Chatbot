@@ -9,6 +9,7 @@ FlaskDebugEnvironmentTest runs app.py's `python app.py` block in a
 subprocess with werkzeug's run_simple replaced, only to record the debug
 settings app.run() would use.
 """
+import logging
 import os
 import subprocess
 import sys
@@ -183,8 +184,8 @@ class CorsDefaultBehaviorTest(unittest.TestCase):
     for the duration of each test - matching test_webhook.py's own
     isolation convention - so the real backend/appointments.json (which
     holds genuine bookings) is never read by any test in this class. Only
-    GET requests are made here, so this is a belt-and-braces isolation
-    choice, not a correctness requirement.
+    GET and OPTIONS (preflight) requests are made here, so this is a
+    belt-and-braces isolation choice, not a correctness requirement.
     """
 
     def setUp(self):
@@ -215,6 +216,57 @@ class CorsDefaultBehaviorTest(unittest.TestCase):
         # requests ever consult Access-Control-Allow-Origin.
         response = self.client.get('/webhook/appointments')
         self.assertEqual(response.status_code, 200)
+
+    def test_allowed_origin_preflight_is_granted(self):
+        response = self.client.options('/webhook/webhook', headers={
+            'Origin': DEFAULT_DEV_ORIGIN,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'content-type',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), DEFAULT_DEV_ORIGIN)
+        self.assertIn('POST', response.headers.get('Access-Control-Allow-Methods', ''))
+        self.assertIn('content-type', response.headers.get('Access-Control-Allow-Headers', '').lower())
+
+    def test_private_network_access_is_not_granted_to_an_allowed_origin(self):
+        # CVE-2024-6221: Flask-Cors 4.0.0 answered this preflight with
+        # Access-Control-Allow-Private-Network: true by default. The app
+        # never opts into private network access.
+        response = self.client.options('/webhook/webhook', headers={
+            'Origin': DEFAULT_DEV_ORIGIN,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Private-Network': 'true',
+        })
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), DEFAULT_DEV_ORIGIN)
+        self.assertNotEqual(response.headers.get('Access-Control-Allow-Private-Network'), 'true')
+
+    def test_crlf_in_request_path_cannot_forge_a_flask_cors_log_line(self):
+        # CVE-2024-1681: with DEBUG logging, Flask-Cors 4.0.0 logged the
+        # decoded request path verbatim, so %0d%0a in the URL started a
+        # new, attacker-controlled log line.
+        records = []
+
+        class Collect(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        cors_logger = logging.getLogger('flask_cors')
+        handler = Collect()
+        previous_level = cors_logger.level
+        cors_logger.addHandler(handler)
+        cors_logger.setLevel(logging.DEBUG)
+        try:
+            self.client.get(
+                '/webhook/providers%0d%0aFORGED-LOG-LINE', headers={'Origin': DEFAULT_DEV_ORIGIN}
+            )
+        finally:
+            cors_logger.removeHandler(handler)
+            cors_logger.setLevel(previous_level)
+
+        self.assertTrue(records, "expected Flask-Cors to log this request at DEBUG")
+        for message in records:
+            self.assertNotIn('\n', message)
+            self.assertNotIn('\r', message)
 
 
 if __name__ == '__main__':
