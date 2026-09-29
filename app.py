@@ -92,6 +92,11 @@ FLASK_DEBUG = _parse_debug_flag(os.environ.get("FLASK_DEBUG"))
 
 # Create the Flask app
 app = Flask(__name__)
+# Largest request body accepted, in bytes. A normal chat turn is well under
+# 1 KB; without a limit a single oversized request could exhaust the one
+# Gunicorn worker's memory. Werkzeug raises RequestEntityTooLarge when a
+# body exceeds this - see backend/webhook.py's handling of it.
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 # Restricted to CORS_ALLOWED_ORIGINS (default: the local frontend dev
 # origin only) - previously CORS(app) allowed every origin
 # unconditionally, which is unsafe for anything beyond local development.

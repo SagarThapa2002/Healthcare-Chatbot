@@ -94,6 +94,14 @@ paths:
         with an error envelope (`success: false`, `error.code:
         INTERNAL_ERROR`).
 
+        The request body is limited to 64 KB (65,536 bytes). A body whose
+        `Content-Length` exceeds that is rejected before it is parsed: the
+        endpoint still returns HTTP 200, with an error envelope whose
+        `error.code` is `REQUEST_TOO_LARGE`. Nothing from the body is
+        echoed back or stored. (A body sent without `Content-Length`, e.g.
+        chunked, is cut off at the limit instead, and the truncated JSON is
+        reported as `INTERNAL_ERROR`.)
+
         Booking, update and cancellation are multi-turn flows. Each turn is
         one request, and `context.bookingStage` / `updateStage` /
         `cancellationStage` report what the server is now waiting for.
@@ -342,7 +350,11 @@ components:
       properties:
         code:
           type: string
-          description: Only INTERNAL_ERROR is emitted today.
+          description: |
+            `INTERNAL_ERROR` for an unexpected server failure or an
+            unparseable body; `REQUEST_TOO_LARGE` when the request body
+            exceeds the 64 KB limit.
+          enum: [INTERNAL_ERROR, REQUEST_TOO_LARGE]
           example: INTERNAL_ERROR
         message:
           type: string

@@ -1,6 +1,7 @@
 import logging
 
 from flask import Blueprint, request, jsonify
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from backend import provider_repository, reminder_service, response_model
 from backend.chatbot_logic import handle_webhook_request, list_appointments
@@ -28,6 +29,15 @@ def webhook():
             result.get("success"),
         )
         return jsonify(result)
+
+    except RequestEntityTooLarge:
+        # The body exceeded app.config["MAX_CONTENT_LENGTH"] (see app.py).
+        # Still HTTP 200, like every other webhook response, with its own
+        # error code so a client can tell it apart from a server failure.
+        logger.warning("webhook request rejected request_id=%s reason=request_too_large", request_id)
+        return jsonify(response_model.error_response(
+            "Request body is too large.", code="REQUEST_TOO_LARGE", request_id=request_id
+        ))
 
     except Exception as e:
         logger.error(
