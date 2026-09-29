@@ -24,6 +24,7 @@ import os
 import uuid
 
 from backend import assistant_service
+from backend import atomic_json
 from backend import availability_service
 from backend import llm_config
 from backend import provider_repository
@@ -57,8 +58,7 @@ def _read_appointments_raw():
 
 
 def _save_appointments(appointments):
-    with open(APPOINTMENTS_FILE, 'w') as f:
-        json.dump(appointments, f, indent=2)
+    atomic_json.write_json_atomic(APPOINTMENTS_FILE, appointments)
 
 
 def list_appointments():
@@ -606,8 +606,7 @@ def _handle_book_appointment(parameters):
         "date": date,
         "time": resolved_time,
     }
-    with open(PENDING_FILE, 'w') as f:
-        json.dump(pending, f, indent=2)
+    atomic_json.write_json_atomic(PENDING_FILE, pending)
     text = (
         f"Please confirm — book appointment with {provider_name} for {name} on "
         f"{date} at {resolved_time}? (yes or no)"
@@ -975,8 +974,7 @@ def _handle_update_appointment(parameters):
     if new_time:
         pending['newTime'] = new_time
 
-    with open(PENDING_UPDATE_FILE, 'w') as f:
-        json.dump(pending, f, indent=2)
+    atomic_json.write_json_atomic(PENDING_UPDATE_FILE, pending)
 
     change_bits = []
     if new_date:
@@ -1250,8 +1248,7 @@ def _handle_cancel_appointment(parameters):
         else:
             pending = {"name": selected['name'], "date": selected['date'], "time": selected['time']}
 
-    with open(PENDING_CANCELLATION_FILE, 'w') as f:
-        json.dump(pending, f, indent=2)
+    atomic_json.write_json_atomic(PENDING_CANCELLATION_FILE, pending)
 
     provider_bit = f" with {selected['providerId']}" if selected.get('providerId') else ""
     text = (

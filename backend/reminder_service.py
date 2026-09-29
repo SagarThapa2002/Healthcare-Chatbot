@@ -26,6 +26,7 @@ import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
+from backend import atomic_json
 from backend import reminder_config
 
 logger = logging.getLogger(__name__)
@@ -134,8 +135,7 @@ def _read_reminders_raw(path=None):
 
 def _save_reminders(reminders, path=None):
     file_path = path or REMINDERS_FILE
-    with open(file_path, 'w') as f:
-        json.dump(reminders, f, indent=2)
+    atomic_json.write_json_atomic(file_path, reminders)
 
 
 def list_reminders(path=None):
