@@ -144,6 +144,63 @@ The deployed frontend's origin must also be listed in the backend's `CORS_ALLOWE
 
 ---
 
+## 🚀 Deployment
+
+> **This is a portfolio/demo deployment, not a production healthcare system.** Read [Data and safety notice](#data-and-safety-notice) before making it public.
+
+The backend and frontend deploy separately to any host that can run a Python web service and serve static files. No platform-specific configuration is included or required. The runtime versions tested in CI are pinned in `.python-version` (Python 3.11) and `frontend/.nvmrc` (Node 24).
+
+| | Backend | Frontend |
+|---|---|---|
+| Root directory | repository root | `frontend/` |
+| Runtime | Python 3.11 | Node 24 |
+| Install | `pip install -r backend/requirements.txt` | `npm ci` |
+| Build | - | `REACT_APP_API_BASE_URL=https://<backend-url> npm run build` |
+| Start / publish | `gunicorn --workers 1 --bind 0.0.0.0:${PORT:-5000} app:app` | publish `frontend/build/` |
+| Health check | `GET /health` | - |
+
+- **Backend:** run exactly one Gunicorn worker, because persistence is JSON-backed (see Backend Setup). `/health` confirms that the provider reference data loads and validates; it does **not** verify that appointment data is stored durably.
+- **Frontend:** serve `frontend/build/` from the root of its domain (the built assets are referenced as `/static/...`). No rewrite rules are needed, because the app has no client-side router.
+
+### Deployment order
+
+1. Deploy the backend.
+2. Configure the backend environment (see the table below).
+3. Verify that `GET /health` returns `200 {"status": "ok"}`.
+4. Note the backend's public URL.
+5. Build and deploy the frontend with `REACT_APP_API_BASE_URL` set to that backend URL.
+6. Set the backend's `CORS_ALLOWED_ORIGINS` to the frontend's deployed origin (e.g. `https://chat.example.com`, no trailing path), then restart the backend.
+7. Open the deployed frontend and check that it can talk to the backend - for example, that the Appointments tab loads and a chat message gets a reply.
+
+### Production environment variables
+
+| Variable | Where | Status | Notes |
+|---|---|---|---|
+| `CORS_ALLOWED_ORIGINS` | backend | **required** | The deployed frontend's origin. If unset, only `http://localhost:3000` is allowed. |
+| `PORT` | backend | required if your host supplies it | Used by the Gunicorn command; falls back to `5000`. |
+| `REACT_APP_API_BASE_URL` | frontend build | **required** | The backend's public URL, applied at build time. If unset, the build calls `http://127.0.0.1:5000`. |
+| `FLASK_DEBUG` | backend | **keep unset or `false`** | Enables Flask's debug mode; never enable it on a deployed server. Flask reads this variable itself, so it affects the app under Gunicorn too. |
+| `LOG_LEVEL` | backend | optional | Default `INFO`. |
+| `CLINIC_TIMEZONE` | backend | optional | IANA timezone (e.g. `Europe/London`); no default. Without it, bookings still work but no reminders are created. |
+| `LLM_ENABLED` | backend | optional - **keep disabled for a public demo** | Default `false`. See the LLM note below. |
+| `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS`, `ANTHROPIC_TIMEOUT_SECONDS` | backend | optional | Only used when `LLM_ENABLED=true`; see `backend/LLM_ASSISTANT_NOTES.md`. |
+| `NOTIFICATION_PROVIDER` | reminder CLI | optional | Only read by `python -m backend.run_due_reminders`; `mock` is the only provider. Not used by the web server. |
+
+Set these through your host's environment-variable settings - `.env` files are not loaded by the backend.
+
+**LLM:** the General Health Questions assistant is optional and disabled by default. The API has no authentication or rate limiting, so enabling it with a real `ANTHROPIC_API_KEY` on a public deployment lets anyone who can reach the site generate API usage billed to that key. Keep `LLM_ENABLED` unset or `false` for a public demo unless you intentionally accept that cost and exposure.
+
+### Data and safety notice
+
+- **Storage is local JSON files.** Appointments, reminders and in-progress conversation state are stored as JSON files in `backend/` on the server's local disk.
+- **Restarts:** data survives a process restart only if the host preserves the disk. Hosts that replace or reset the filesystem on restart or redeploy lose all stored data.
+- **Redeploys:** `backend/appointments.json` and `backend/reminders.json` are tracked in Git, so a Git-based redeploy can reset them to the repository's version.
+- **Shared conversation state:** an in-progress booking, cancellation or update is held in a single global file shared by every visitor, not per user or session - one visitor's "yes" can confirm another visitor's pending action.
+- **No authentication:** every endpoint is public. `GET /webhook/appointments` and `GET /webhook/reminders` return all stored records to anyone.
+- **Do not enter real patient or personal information.** Use made-up names and details only.
+
+---
+
 ## 🔔 Appointment Reminders
 
 The backend includes a deterministic appointment-reminder subsystem (Phase 6.2). It is functional but **not automatic** and **not connected to any real notification provider** - see the limitations below before assuming this sends real reminders to anyone.
