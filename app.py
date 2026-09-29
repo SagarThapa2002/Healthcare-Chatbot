@@ -62,12 +62,20 @@ def _parse_allowed_origins(raw_value):
 
 
 def _parse_debug_flag(raw_value):
-    """Parses FLASK_DEBUG into a bool - only the exact value "true"
+    """Parses FLASK_DEBUG into the `debug` argument passed to app.run() in
+    the `python app.py` block below - only the exact value "true"
     (case-insensitive, whitespace-trimmed) enables it; None, blank, or any
     other value (e.g. "1", "yes") all resolve to False identically,
     matching backend/llm_config.LLM_ENABLED's own identical parsing
-    convention. Fails safe toward OFF - a malformed value can never
-    accidentally enable debug mode.
+    convention. app.run()'s `debug` argument overrides Flask's own reading
+    of the variable, so this rule governs the development server only.
+
+    It does NOT govern the imported `app` (e.g. under Gunicorn, which never
+    calls app.run()): Flask reads FLASK_DEBUG itself when the app is
+    created, and treats any value other than unset/empty, "0", "false" or
+    "no" (case-insensitive, NOT trimmed) as on - so "1", "yes" or "false "
+    enable app.debug there. Keep FLASK_DEBUG unset or "false" anywhere the
+    app is deployed.
     """
     return (raw_value or "").strip().lower() == "true"
 
@@ -122,5 +130,6 @@ if __name__ == '__main__':
     # mode enables the interactive debugger and code reloading, neither
     # of which should ever be reachable outside a developer's own
     # machine). Set FLASK_DEBUG=true to opt back into the previous local
-    # development behavior.
+    # development behavior. FLASK_DEBUG passed here overrides Flask's own,
+    # looser reading of the variable - see _parse_debug_flag above.
     app.run(debug=FLASK_DEBUG)

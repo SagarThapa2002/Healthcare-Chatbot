@@ -4,11 +4,14 @@ Covers the two parsing functions (_parse_debug_flag/_parse_allowed_origins)
 directly - pure, deterministic, no environment/network dependency - plus a
 small integration check that the already-imported `app` object's live
 CORS configuration actually behaves as those functions say it should for
-the default (no env override) case. Debug mode itself is never exercised
-via a real app.run() call anywhere in this file (that would start a real
-server) - only the parsing function that decides its value.
+the default (no env override) case. No real server is ever started:
+FlaskDebugEnvironmentTest runs app.py's `python app.py` block in a
+subprocess with werkzeug's run_simple replaced, only to record the debug
+settings app.run() would use.
 """
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -34,11 +37,92 @@ class ParseDebugFlagTest(unittest.TestCase):
         self.assertTrue(_parse_debug_flag("  true  "))
 
     def test_malformed_or_unexpected_values_fail_safe_to_false(self):
-        # A malformed/unexpected value must never accidentally enable
-        # debug mode - only the exact "true" spelling does.
+        # For `python app.py`'s development server, a malformed/unexpected
+        # value must never accidentally enable debug mode - only the exact
+        # "true" spelling does. (Flask's own reading of FLASK_DEBUG for the
+        # imported app is looser - see FlaskDebugEnvironmentTest below.)
         for value in ("1", "yes", "on", "false", "TRUE ish", "0"):
             with self.subTest(value=value):
                 self.assertFalse(_parse_debug_flag(value))
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Imports app (as Gunicorn does), records app.debug, then runs app.py's own
+# `python app.py` block with werkzeug's run_simple replaced, so no server
+# ever starts, and records the debug settings app.run() would have used.
+_DEBUG_PROBE = """
+import logging, runpy
+from unittest.mock import patch
+logging.disable(logging.CRITICAL)
+import app
+imported = app.app.debug
+captured = {}
+def fake_run_simple(host, port, application, **options):
+    captured.update(options, debug=application.debug)
+with patch("werkzeug.serving.run_simple", fake_run_simple):
+    runpy.run_path("app.py", run_name="__main__")
+print("RESULT", imported, captured["debug"], captured["use_debugger"])
+"""
+
+
+class FlaskDebugEnvironmentTest(unittest.TestCase):
+    """Documents how FLASK_DEBUG actually behaves on both startup paths.
+
+    FLASK_DEBUG is read once, when the app is created, so each case runs
+    in a fresh subprocess with only that variable changed - nothing leaks
+    into this test process or other tests.
+    """
+
+    def _probe(self, value):
+        env = {k: v for k, v in os.environ.items() if k != "FLASK_DEBUG"}
+        if value is not None:
+            env["FLASK_DEBUG"] = value
+        env["PYTHONPATH"] = REPO_ROOT
+        result = subprocess.run(
+            [sys.executable, "-c", _DEBUG_PROBE],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = [l for l in result.stdout.splitlines() if l.startswith("RESULT ")][-1]
+        imported, dev_debug, dev_debugger = line.split()[1:]
+        return {
+            "imported_app_debug": imported == "True",
+            "dev_server_debug": dev_debug == "True",
+            "dev_server_debugger": dev_debugger == "True",
+        }
+
+    def test_unset_disables_debug_on_both_paths(self):
+        self.assertEqual(
+            self._probe(None),
+            {"imported_app_debug": False, "dev_server_debug": False, "dev_server_debugger": False},
+        )
+
+    def test_false_disables_debug_on_both_paths(self):
+        self.assertEqual(
+            self._probe("false"),
+            {"imported_app_debug": False, "dev_server_debug": False, "dev_server_debugger": False},
+        )
+
+    def test_true_enables_debug_on_both_paths(self):
+        self.assertEqual(
+            self._probe("true"),
+            {"imported_app_debug": True, "dev_server_debug": True, "dev_server_debugger": True},
+        )
+
+    def test_one_enables_flask_debug_for_the_imported_app_but_not_python_app_py(self):
+        # Under Gunicorn the imported app is what serves requests, so
+        # FLASK_DEBUG=1 turns Flask's debug mode on in a deployment.
+        self.assertEqual(
+            self._probe("1"),
+            {"imported_app_debug": True, "dev_server_debug": False, "dev_server_debugger": False},
+        )
+
+    def test_yes_enables_flask_debug_for_the_imported_app_but_not_python_app_py(self):
+        self.assertEqual(
+            self._probe("yes"),
+            {"imported_app_debug": True, "dev_server_debug": False, "dev_server_debugger": False},
+        )
 
 
 class ParseAllowedOriginsTest(unittest.TestCase):
