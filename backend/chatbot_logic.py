@@ -731,6 +731,27 @@ def _booked_provider_phrase(provider_id):
     return f" with {provider['name']} ({provider['specialty']}, {provider['location']})"
 
 
+def _provider_display_name(provider_id):
+    """The provider's human-readable name for user-facing text, read through
+    provider_repository.find_provider() - e.g. 'Dr. Patel' for 'dr-patel'.
+
+    Only ever changes what is displayed: callers keep using provider_id as
+    the identifier. An unknown id falls back to the id itself (as the
+    booking prompts already do), and unreadable provider data
+    (ProviderDataError) also falls back to the id instead of raising, so a
+    display lookup can never interrupt a cancellation or update flow.
+    """
+    try:
+        provider = provider_repository.find_provider(provider_id)
+    except provider_repository.ProviderDataError as e:
+        logger.warning(
+            "provider display-name lookup failed provider_id=%s exception_type=%s",
+            provider_id, type(e).__name__,
+        )
+        return provider_id
+    return provider["name"] if provider else provider_id
+
+
 def _schedule_reminder_for_booking(appointment):
     """Phase 6.2-H: creates a pending 24h_before reminder for a newly
     booked `appointment`, if eligible (backend/reminder_service.py).
@@ -1120,7 +1141,7 @@ def _describe_candidate(appointment):
         parts.append(f"ID {appointment['id']}")
     parts.append(f"{appointment['date']} at {appointment['time']}")
     if appointment.get('providerId'):
-        parts.append(f"provider {appointment['providerId']}")
+        parts.append(f"provider {_provider_display_name(appointment['providerId'])}")
     return "- " + ", ".join(parts)
 
 
@@ -1250,7 +1271,7 @@ def _handle_cancel_appointment(parameters):
 
     atomic_json.write_json_atomic(PENDING_CANCELLATION_FILE, pending)
 
-    provider_bit = f" with {selected['providerId']}" if selected.get('providerId') else ""
+    provider_bit = f" with {_provider_display_name(selected['providerId'])}" if selected.get('providerId') else ""
     text = (
         f"Please confirm — cancel the appointment for {selected['name']} on {selected['date']} "
         f"at {selected['time']}{provider_bit}? (yes or no)"
