@@ -1168,3 +1168,264 @@ describe('interrupting a booking discards the backend pending booking only at CO
     expect(intentsSent().slice(-3)).toEqual(['NoIntent', 'View Appointments', 'YesIntent']);
   });
 });
+
+// Leaving a cancellation or update before CONFIRM. The backend holds no
+// pending state at these steps, so "no" and task switches are handled
+// locally: no request for "no", and a task switch is routed normally instead
+// of being sent as an appointment name or re-prompted.
+describe('leaving cancel/update flows before confirmation', () => {
+  const LEFT_UNCHANGED = "Okay, I've left your appointment unchanged.";
+  const APPOINTMENT_ID = '11111111-1111-4111-8111-111111111111';
+
+  beforeEach(() => {
+    callBackend.mockReset();
+    callBackend.mockResolvedValue(fakeEnvelope());
+  });
+
+  async function reachCancelIdentifier(result) {
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('What is the ID or name?', 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+  }
+
+  async function reachUpdateIdentifier(result) {
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What is the ID or name?', 'identifier'));
+    await submitMessage(result, 'update my appointment');
+  }
+
+  async function reachUpdateFields(result) {
+    await reachUpdateIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What new date or time?', 'fields'));
+    await submitMessage(result, 'Sagar');
+  }
+
+  function callsSince(before) {
+    return callBackend.mock.calls.slice(before);
+  }
+
+  function lastBotText(result) {
+    return result.current.messages.filter((m) => m.sender === 'bot').at(-1).content.text;
+  }
+
+  // After leaving a flow, a plain name must be routed as ordinary input
+  // (General FAQ), not as that flow's identifier or fields reply.
+  async function expectFlowLeft(result) {
+    const before = callBackend.mock.calls.length;
+    await submitMessage(result, 'Sagar');
+    expect(callsSince(before)).toEqual([['General FAQ', { message: 'Sagar' }]]);
+  }
+
+  const SWITCHES = {
+    book: ['book an appointment', 'Book Appointment', {}],
+    view: ['view my appointments', 'View Appointments', {}],
+    symptom: ['I have a headache', 'Symptom Check', { symptom: 'I have a headache' }],
+    cancel: ['cancel my appointment', 'Cancel Appointment', {}],
+    update: ['update my appointment', 'Update Appointment', {}],
+  };
+
+  // --- update: fields step ---
+
+  test('update fields: "no" leaves the flow locally, with no backend request', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'no');
+
+    expect(callsSince(before)).toEqual([]);
+    expect(lastBotText(result)).toBe(LEFT_UNCHANGED);
+    await expectFlowLeft(result);
+  });
+
+  test.each(['book', 'view', 'symptom', 'cancel'])('update fields: the %s request switches task', async (key) => {
+    const [message, intent, params] = SWITCHES[key];
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, message);
+
+    expect(callsSince(before)).toEqual([[intent, params]]);
+  });
+
+  test('update fields: "update my appointment" stays in the update flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'update my appointment');
+    expect(callsSince(before)).toEqual([]); // the existing local re-prompt
+
+    await submitMessage(result, '2026-12-30');
+    expect(callsSince(before)).toEqual([['Update Appointment', { name: 'Sagar', date: '2026-12-30' }]]);
+  });
+
+  test('update fields: text that is neither a date/time nor a task switch still re-prompts', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'not a date or a time');
+
+    expect(callsSince(before)).toEqual([]);
+    expect(lastBotText(result)).toMatch(/I didn't catch a new date or time/);
+  });
+
+  test('update fields: a valid date and time are still sent with the identifier', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, '2026-12-30 14:00');
+
+    expect(callsSince(before)).toEqual([['Update Appointment', { name: 'Sagar', date: '2026-12-30', time: '14:00' }]]);
+  });
+
+  // --- cancel: identifier step ---
+
+  test.each(['book', 'view', 'symptom', 'update'])('cancel identifier: the %s request switches task instead of becoming a name', async (key) => {
+    const [message, intent, params] = SWITCHES[key];
+    const { result } = renderHook(() => useConversation());
+    await reachCancelIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, message);
+
+    expect(callsSince(before)).toEqual([[intent, params]]);
+    expect(callBackend).not.toHaveBeenCalledWith('Cancel Appointment', { name: message });
+  });
+
+  test('cancel identifier: after a switch to viewing, the cancellation flow is left', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachCancelIdentifier(result);
+    await submitMessage(result, 'view my appointments');
+    await expectFlowLeft(result);
+  });
+
+  test('cancel identifier: "cancel my appointment" stays in the cancellation flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachCancelIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'cancel my appointment');
+
+    expect(callsSince(before)).toEqual([['Cancel Appointment', { name: 'cancel my appointment' }]]);
+  });
+
+  test('cancel identifier: "no" leaves the flow locally, with no backend request', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachCancelIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'no');
+
+    expect(callsSince(before)).toEqual([]);
+    expect(lastBotText(result)).toBe(LEFT_UNCHANGED);
+    await expectFlowLeft(result);
+  });
+
+  test('cancel identifier: a name and a UUID are still sent as name and id', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachCancelIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Which one?', 'identifier'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
+
+    await submitMessage(result, APPOINTMENT_ID);
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { id: APPOINTMENT_ID });
+  });
+
+  // --- update: identifier step ---
+
+  test.each(['book', 'view', 'symptom', 'cancel'])('update identifier: the %s request switches task instead of becoming a name', async (key) => {
+    const [message, intent, params] = SWITCHES[key];
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, message);
+
+    expect(callsSince(before)).toEqual([[intent, params]]);
+    expect(callBackend).not.toHaveBeenCalledWith('Update Appointment', { name: message });
+  });
+
+  test('update identifier: "update my appointment" stays in the update flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'update my appointment');
+
+    expect(callsSince(before)).toEqual([['Update Appointment', { name: 'update my appointment' }]]);
+  });
+
+  test('update identifier: "no" leaves the flow locally, with no backend request', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateIdentifier(result);
+    const before = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'no');
+
+    expect(callsSince(before)).toEqual([]);
+    expect(lastBotText(result)).toBe(LEFT_UNCHANGED);
+    await expectFlowLeft(result);
+  });
+
+  test('update identifier: a name and a UUID are still sent as name and id', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Which one?', 'identifier'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar' });
+
+    await submitMessage(result, APPOINTMENT_ID);
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { id: APPOINTMENT_ID });
+  });
+
+  // --- regression and unchanged confirm steps ---
+
+  test('regression: the update-fields trap - "no" and a new task both get the user out', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateFields(result);
+    const reprompts = () => result.current.messages.filter((m) => /I didn't catch a new date or time/.test(m.content?.text ?? '')).length;
+
+    await submitMessage(result, 'no');
+    expect(reprompts()).toBe(0);
+    expect(lastBotText(result)).toBe(LEFT_UNCHANGED);
+
+    await reachUpdateFields(result);
+    const before = callBackend.mock.calls.length;
+    callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name?', 'name'));
+    await submitMessage(result, 'book an appointment');
+    expect(callsSince(before)).toEqual([['Book Appointment', {}]]);
+    expect(reprompts()).toBe(0);
+
+    // The booking flow is now active: the next reply is its name, not an update field.
+    callBackend.mockResolvedValueOnce(envelopeWithText('Which provider?', 'provider'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar' });
+  });
+
+  test('confirm steps are unchanged: a task request only re-prompts, and "no" still sends NoIntent', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachUpdateIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+
+    let before = callBackend.mock.calls.length;
+    await submitMessage(result, 'book an appointment');
+    expect(callsSince(before)).toEqual([]);
+    expect(lastBotText(result)).toMatch(/reply "yes" to confirm the update/);
+
+    await submitMessage(result, 'no');
+    expect(callsSince(before)).toEqual([['NoIntent', {}]]);
+
+    await reachCancelIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+    before = callBackend.mock.calls.length;
+    await submitMessage(result, 'view my appointments');
+    expect(callsSince(before)).toEqual([]);
+    await submitMessage(result, 'no');
+    expect(callsSince(before)).toEqual([['NoIntent', {}]]);
+  });
+});

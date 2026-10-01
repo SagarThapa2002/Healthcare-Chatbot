@@ -54,6 +54,22 @@ function deriveUpdateState(envelope, identifier) {
   return { stage, identifier: keepIdentifier ? identifier : null };
 }
 
+// Before a cancellation or update reaches CONFIRM the backend holds no
+// pending state for it (it is written only at CONFIRM), so the user can leave
+// these steps purely locally. Returns 'no' for an exact "no" (the same exact
+// match used for the confirm steps), 'switch' when the existing intent
+// detector sees a clear switch to a different task (never for General FAQ,
+// and never for the flow's own intent, so "cancel my appointment" stays in
+// the cancellation flow), otherwise null.
+const TASK_SWITCH_INTENTS = ['Book Appointment', ...INTERRUPTION_INTENTS];
+const LEFT_UNCHANGED_TEXT = "Okay, I've left your appointment unchanged.";
+
+function leaveBeforeConfirm(text, currentFlowIntent) {
+  if (text.trim().toLowerCase() === 'no') return 'no';
+  const intent = detectIntent(text);
+  return TASK_SWITCH_INTENTS.includes(intent) && intent !== currentFlowIntent ? 'switch' : null;
+}
+
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
@@ -305,12 +321,23 @@ function useConversation() {
           return;
         }
 
-        const trimmed = text.trim();
-        const parameters = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
-        const envelope = await callBackend('Cancel Appointment', parameters);
-        setCancellationStage(envelope.context?.cancellationStage ?? null);
-        sayEnvelope(envelope);
-        return;
+        const leave = leaveBeforeConfirm(text, 'Cancel Appointment');
+        if (leave === 'no') {
+          setCancellationStage(null);
+          sayText(LEFT_UNCHANGED_TEXT);
+          return;
+        }
+        if (leave !== 'switch') {
+          const trimmed = text.trim();
+          const parameters = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
+          const envelope = await callBackend('Cancel Appointment', parameters);
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
+          sayEnvelope(envelope);
+          return;
+        }
+        // A different task: leave the cancellation and route this message
+        // normally below, instead of sending it as an appointment name.
+        setCancellationStage(null);
       }
 
       // Update's local state machine: same "reached only when no booking
@@ -345,24 +372,34 @@ function useConversation() {
         // against appointment data. Backend validation (format, and
         // provider availability) remains authoritative either way; this
         // only decides whether there's anything worth sending yet.
-        const date = parseDate(text);
-        const time = parseTime(text);
-
-        if (!date && !time) {
-          sayText(
-            "I didn't catch a new date or time - could you give me a date (e.g. 2026-12-26) "
-            + "and/or a time (e.g. 14:00)?"
-          );
+        const leave = leaveBeforeConfirm(text, 'Update Appointment');
+        if (leave === 'no') {
+          setUpdate({ stage: null, identifier: null });
+          sayText(LEFT_UNCHANGED_TEXT);
           return;
         }
+        if (leave !== 'switch') {
+          const date = parseDate(text);
+          const time = parseTime(text);
 
-        const parameters = { ...update.identifier };
-        if (date) parameters.date = date;
-        if (time) parameters.time = time;
-        const envelope = await callBackend('Update Appointment', parameters);
-        setUpdate(deriveUpdateState(envelope, update.identifier));
-        sayEnvelope(envelope);
-        return;
+          if (!date && !time) {
+            sayText(
+              "I didn't catch a new date or time - could you give me a date (e.g. 2026-12-26) "
+              + "and/or a time (e.g. 14:00)?"
+            );
+            return;
+          }
+
+          const parameters = { ...update.identifier };
+          if (date) parameters.date = date;
+          if (time) parameters.time = time;
+          const envelope = await callBackend('Update Appointment', parameters);
+          setUpdate(deriveUpdateState(envelope, update.identifier));
+          sayEnvelope(envelope);
+          return;
+        }
+        // A different task: leave the update and route this message normally below.
+        setUpdate({ stage: null, identifier: null });
       }
 
       if (update.stage === 'identifier') {
@@ -371,12 +408,22 @@ function useConversation() {
           return;
         }
 
-        const trimmed = text.trim();
-        const identifierParams = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
-        const envelope = await callBackend('Update Appointment', identifierParams);
-        setUpdate(deriveUpdateState(envelope, identifierParams));
-        sayEnvelope(envelope);
-        return;
+        const leave = leaveBeforeConfirm(text, 'Update Appointment');
+        if (leave === 'no') {
+          setUpdate({ stage: null, identifier: null });
+          sayText(LEFT_UNCHANGED_TEXT);
+          return;
+        }
+        if (leave !== 'switch') {
+          const trimmed = text.trim();
+          const identifierParams = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
+          const envelope = await callBackend('Update Appointment', identifierParams);
+          setUpdate(deriveUpdateState(envelope, identifierParams));
+          sayEnvelope(envelope);
+          return;
+        }
+        // A different task: leave the update and route this message normally below.
+        setUpdate({ stage: null, identifier: null });
       }
 
       // No booking, cancellation, or update in progress - ordinary
