@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { detectIntent, INTERRUPTION_INTENTS } from '../conversation/intent';
 import { parseDate, parseTime } from '../conversation/dateTime';
 import { isValidName } from '../conversation/validation';
@@ -8,7 +8,7 @@ import {
   bookingParams,
   extractInitialBookingFields,
 } from '../conversation/booking';
-import { callBackend } from '../api/client';
+import { callBackend, startConversation } from '../api/client';
 
 // Prefixes the display text of an envelope's first message, leaving every
 // other field (type, suggestions, context, meta, success, error) untouched.
@@ -74,6 +74,13 @@ function useConversation() {
   // "identifier" stage - see deriveUpdateState's own comment for why this
   // one flow needs slightly more than a bare stage value.
   const [update, setUpdate] = useState({ stage: null, identifier: null });
+
+  // One conversation session per mount: every webhook request from this
+  // conversation carries the same session (see api/client.js), and booking,
+  // cancellation or update completing never starts a new one.
+  useEffect(() => {
+    startConversation();
+  }, []);
 
   // For plain client-side prompts (validation messages, etc.) that never
   // went through the backend, so they render with the same shape as a

@@ -195,7 +195,7 @@ Set these through your host's environment-variable settings - `.env` files are n
 - **Storage is local JSON files.** Appointments, reminders and in-progress conversation state are stored as JSON files in `backend/` on the server's local disk.
 - **Restarts:** data survives a process restart only if the host preserves the disk. Hosts that replace or reset the filesystem on restart or redeploy lose all stored data.
 - **Redeploys:** `backend/appointments.json` and `backend/reminders.json` are tracked in Git, so a Git-based redeploy can reset them to the repository's version.
-- **Shared conversation state:** an in-progress booking, cancellation or update is held in a single global file shared by every visitor, not per user or session - one visitor's "yes" can confirm another visitor's pending action.
+- **Per-conversation state:** an in-progress booking, cancellation or update is isolated per chat session - the frontend sends a random session id with each request, so one visitor's "yes" cannot confirm another visitor's pending action. The session id only separates conversations; it is not authentication.
 - **No authentication:** every endpoint is public. `GET /webhook/appointments` and `GET /webhook/reminders` return all stored records to anyone.
 - **Do not enter real patient or personal information.** Use made-up names and details only.
 

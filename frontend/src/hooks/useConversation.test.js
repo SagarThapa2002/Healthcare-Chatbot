@@ -1,13 +1,14 @@
 import { act, renderHook, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { useConversation } from './useConversation';
 import Chatbot from '../components/Chatbot';
-import { callBackend } from '../api/client';
+import { callBackend, startConversation } from '../api/client';
 
 // Only the payload construction is under test here - callBackend itself
 // (network/normalization) is mocked entirely, so these tests never touch
 // the network and don't need a real backend running.
 jest.mock('../api/client', () => ({
   callBackend: jest.fn(),
+  startConversation: jest.fn(),
 }));
 
 function fakeEnvelope() {
@@ -949,5 +950,30 @@ describe('backend-provided appointment suggestion chips (rendered Chatbot)', () 
     fireEvent.click(await screen.findByRole('button', { name: 'No' }));
     await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {}));
     expect(callBackend).toHaveBeenCalledTimes(6);
+  });
+});
+
+describe('conversation session lifecycle', () => {
+  beforeEach(() => {
+    callBackend.mockReset();
+    callBackend.mockResolvedValue(fakeEnvelope());
+    startConversation.mockClear();
+  });
+
+  test('a conversation is started once per mount, not once per request', async () => {
+    const { result, rerender, unmount } = renderHook(() => useConversation());
+    expect(startConversation).toHaveBeenCalledTimes(1);
+
+    await submitMessage(result, 'What is a balanced diet?');
+    await submitMessage(result, 'yes');
+    await submitMessage(result, 'no');
+    rerender();
+
+    expect(callBackend).toHaveBeenCalledTimes(3);
+    expect(startConversation).toHaveBeenCalledTimes(1);
+
+    unmount();
+    renderHook(() => useConversation());
+    expect(startConversation).toHaveBeenCalledTimes(2);
   });
 });

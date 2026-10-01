@@ -17,11 +17,48 @@ function resolveApiBaseUrl(raw) {
 // and ends up in the public JS bundle (so it must never hold a secret).
 const API_BASE_URL = resolveApiBaseUrl(process.env.REACT_APP_API_BASE_URL);
 
+// The current chat conversation's session id, set by startConversation()
+// when a Chatbot conversation mounts. Sent as the top-level `session` of
+// every webhook request so the backend keeps this conversation's pending
+// booking/update/cancellation separate from other visitors'. It isolates
+// conversations; it is not authentication. Never logged or displayed.
+let conversationSession = null;
+
+// A random RFC 4122 v4 UUID, in the exact 8-4-4-4-12 form the backend
+// accepts. crypto.randomUUID() needs a secure context (HTTPS or localhost),
+// so crypto.getRandomValues() - available everywhere - is the fallback.
+// With no crypto at all this returns null and no session is sent, leaving
+// the backend's legacy behaviour; Math.random() is never used because a
+// guessable id would weaken the isolation.
+function newSessionId() {
+  const cryptoApi = typeof window !== 'undefined' ? window.crypto : undefined;
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+    return cryptoApi.randomUUID();
+  }
+  if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+    const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  return null;
+}
+
+// Starts a new conversation session. Called once per Chatbot mount (see
+// useConversation), so the session lasts exactly as long as the chat's own
+// conversation state - a remount (e.g. switching tabs) starts a new one.
+function startConversation() {
+  conversationSession = newSessionId();
+}
+
 async function callBackend(intent, parameters) {
+  const queryResult = { intent: { displayName: intent }, parameters };
+  const payload = conversationSession ? { session: conversationSession, queryResult } : { queryResult };
   const response = await fetch(`${API_BASE_URL}/webhook/webhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ queryResult: { intent: { displayName: intent }, parameters } }),
+    body: JSON.stringify(payload),
   });
   const data = await response.json();
   return normalizeResponse(data);
@@ -52,4 +89,4 @@ async function getProviders() {
   return response.json();
 }
 
-export { callBackend, getAppointments, getProviders, resolveApiBaseUrl };
+export { callBackend, getAppointments, getProviders, resolveApiBaseUrl, startConversation };

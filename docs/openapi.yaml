@@ -19,7 +19,10 @@ info:
       the HTTP status.
     - The `GET` list endpoints return raw JSON arrays with no envelope.
     - Conversation state (pending booking/update/cancellation) is held
-      server-side in shared files, not per client or per session.
+      server-side. When a request includes a valid `session` (a UUID for
+      one conversation), that state is isolated per conversation; requests
+      without one share a single legacy state. The session isolates
+      conversations - it is not authentication.
 servers:
   - url: http://127.0.0.1:5000
     description: Local development server (`python app.py`), as used by frontend/src/api/client.js
@@ -238,6 +241,16 @@ components:
     WebhookRequest:
       type: object
       properties:
+        session:
+          type: string
+          format: uuid
+          description: |
+            Optional id for one conversation, sent with every request of that
+            conversation. A valid UUID keeps the conversation's pending
+            booking/update/cancellation separate from other conversations';
+            a missing or invalid value uses the shared legacy state. Not
+            authentication.
+          example: 3f2b8c1e-9a4d-4e6f-8b2a-1c5d7e9f0a3b
         queryResult:
           type: object
           properties:

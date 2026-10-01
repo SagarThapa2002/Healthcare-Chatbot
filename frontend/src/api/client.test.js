@@ -1,4 +1,7 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { webcrypto } from 'crypto';
 import { getProviders, resolveApiBaseUrl } from './client';
+import Chatbot from '../components/Chatbot';
 
 // fetch is mocked entirely - these tests never touch the network and
 // don't need a real backend running.
@@ -139,4 +142,226 @@ test('loading the client with an override does not leak the variable into later 
   const before = process.env.REACT_APP_API_BASE_URL;
   loadClientWith('https://api.example.com');
   expect(process.env.REACT_APP_API_BASE_URL).toBe(before);
+});
+
+// --- conversation session -------------------------------------------------
+//
+// The Jest environment (jsdom) has no `crypto`, so each test installs exactly
+// the crypto API it needs and removes it afterwards. The client holds the
+// current session in module state, so each test loads a fresh copy.
+
+const SESSION_1 = 'd1571ac7-5e55-4a1d-9c1e-000000000001';
+const SESSION_2 = 'd1571ac7-5e55-4a1d-9c1e-000000000002';
+const V4_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function installCrypto(api) {
+  Object.defineProperty(globalThis, 'crypto', { value: api, configurable: true, writable: true });
+}
+
+function removeCrypto() {
+  delete globalThis.crypto;
+}
+
+function freshClient() {
+  let client;
+  jest.isolateModules(() => {
+    client = require('./client');
+  });
+  return client;
+}
+
+function sentBodies() {
+  return global.fetch.mock.calls.map(([, options]) => JSON.parse(options.body));
+}
+
+describe('conversation session on webhook requests', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue({ json: () => Promise.resolve({ fulfillmentText: 'ok' }) });
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+    removeCrypto();
+  });
+
+  test('crypto.randomUUID() provides the session, sent top-level next to an unchanged queryResult', async () => {
+    installCrypto({ randomUUID: jest.fn(() => SESSION_1) });
+    const client = freshClient();
+    client.startConversation();
+
+    await client.callBackend('Book Appointment', { name: 'Sagar' });
+
+    const [, options] = global.fetch.mock.calls[0];
+    expect(options.body).toBe(JSON.stringify({
+      session: SESSION_1,
+      queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
+    }));
+    const body = JSON.parse(options.body);
+    expect(body.queryResult).toEqual({ intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } });
+    expect(body.queryResult).not.toHaveProperty('session');
+  });
+
+  test('every request in one conversation reuses the same session, generated once', async () => {
+    const randomUUID = jest.fn(() => SESSION_1);
+    installCrypto({ randomUUID });
+    const client = freshClient();
+    client.startConversation();
+
+    await client.callBackend('Book Appointment', {});
+    await client.callBackend('YesIntent', {});
+    await client.callBackend('View Appointments', {});
+
+    expect(sentBodies().map((b) => b.session)).toEqual([SESSION_1, SESSION_1, SESSION_1]);
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+  });
+
+  test('starting a new conversation gives a new session', async () => {
+    installCrypto({ randomUUID: jest.fn().mockReturnValueOnce(SESSION_1).mockReturnValueOnce(SESSION_2) });
+    const client = freshClient();
+
+    client.startConversation();
+    await client.callBackend('Book Appointment', {});
+    client.startConversation();
+    await client.callBackend('Book Appointment', {});
+
+    expect(sentBodies().map((b) => b.session)).toEqual([SESSION_1, SESSION_2]);
+  });
+
+  test('without randomUUID, getRandomValues() produces a valid v4 UUID', async () => {
+    installCrypto({ getRandomValues: (array) => webcrypto.getRandomValues(array) });
+    const client = freshClient();
+    client.startConversation();
+
+    await client.callBackend('Book Appointment', {});
+
+    expect(sentBodies()[0].session).toMatch(V4_UUID);
+  });
+
+  test('the getRandomValues() fallback sets the v4 version and RFC 4122 variant bits', async () => {
+    installCrypto({ getRandomValues: (array) => array.fill(0xff) });
+    const client = freshClient();
+    client.startConversation();
+
+    await client.callBackend('Book Appointment', {});
+
+    expect(sentBodies()[0].session).toBe('ffffffff-ffff-4fff-bfff-ffffffffffff');
+  });
+
+  test('with no usable crypto, no session field is sent', async () => {
+    removeCrypto();
+    const client = freshClient();
+    client.startConversation();
+
+    await client.callBackend('Book Appointment', { name: 'Sagar' });
+
+    expect(global.fetch.mock.calls[0][1].body).toBe(JSON.stringify({
+      queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
+    }));
+  });
+
+  test('before any conversation starts, no session field is sent', async () => {
+    installCrypto({ randomUUID: jest.fn(() => SESSION_1) });
+    const client = freshClient();
+
+    await client.callBackend('Book Appointment', {});
+
+    expect(sentBodies()[0]).not.toHaveProperty('session');
+  });
+
+  test('response and error handling are unchanged when a session is sent', async () => {
+    installCrypto({ randomUUID: jest.fn(() => SESSION_1) });
+    const client = freshClient();
+    client.startConversation();
+
+    global.fetch.mockResolvedValueOnce({ json: () => Promise.resolve({ fulfillmentText: 'hello' }) });
+    const legacy = await client.callBackend('General FAQ', {});
+    expect(legacy.messages[0].content.text).toBe('hello');
+
+    global.fetch.mockResolvedValueOnce({ json: () => Promise.resolve(null) });
+    const malformed = await client.callBackend('General FAQ', {});
+    expect(malformed.success).toBe(false);
+    expect(malformed.error.code).toBe('CLIENT_ERROR');
+  });
+});
+
+// The real Chatbot (real useConversation + real client, only fetch mocked):
+// one mount is one conversation, across a full booking, cancellation and
+// update, and the session never reaches the page.
+describe('conversation session across a mounted Chatbot', () => {
+  const APPOINTMENT_ID = '11111111-1111-4111-8111-111111111111';
+
+  function envelope(text, context = {}) {
+    return {
+      success: true,
+      error: null,
+      messages: [{ type: 'text', content: { text }, suggestions: [] }],
+      context: { intent: 'x', ...context },
+      meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+    };
+  }
+
+  async function say(value) {
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+  }
+
+  beforeEach(() => {
+    global.fetch = jest.fn();
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+    removeCrypto();
+  });
+
+  test('one session per mount, kept through booking, cancellation and update, never rendered', async () => {
+    const randomUUID = jest.fn().mockReturnValueOnce(SESSION_1).mockReturnValueOnce(SESSION_2);
+    installCrypto({ randomUUID });
+    const script = [
+      envelope('May I have your name?', { bookingStage: 'name' }),
+      envelope('Which provider?', { bookingStage: 'provider' }),
+      envelope('What date?', { bookingStage: 'date' }),
+      envelope('Available times', { bookingStage: 'slot' }),
+      envelope('Please confirm (yes or no)', { bookingStage: 'confirm' }),
+      envelope('Your appointment has been booked.', { bookingStage: 'booked' }),
+      envelope('What is the ID or name?', { cancellationStage: 'identifier' }),
+      envelope('Please confirm the cancellation (yes or no)', { cancellationStage: 'confirm' }),
+      envelope('Your appointment has been cancelled.', { cancellationStage: 'cancelled' }),
+      envelope('What is the ID or name?', { updateStage: 'identifier' }),
+      envelope('What new date or time?', { updateStage: 'fields' }),
+      envelope('Please confirm the update (yes or no)', { updateStage: 'confirm' }),
+      envelope('Your appointment has been updated.', { updateStage: 'updated' }),
+      envelope('Here are your appointments.'),
+    ];
+    script.forEach((reply) => global.fetch.mockResolvedValueOnce({ json: () => Promise.resolve(reply) }));
+
+    const { unmount } = render(<Chatbot />);
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+
+    for (const message of [
+      'book an appointment', 'Sagar', 'dr-patel', '2026-12-28', '10:00', 'yes',
+      'cancel my appointment', APPOINTMENT_ID, 'yes',
+      'update my appointment', APPOINTMENT_ID, '2026-12-30', 'yes',
+      'show my appointments',
+    ]) {
+      await say(message);
+    }
+
+    const bodies = sentBodies();
+    expect(bodies).toHaveLength(script.length);
+    expect(new Set(bodies.map((b) => b.session))).toEqual(new Set([SESSION_1]));
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(document.body.innerHTML).not.toContain(SESSION_1);
+
+    // A new mount is a new conversation.
+    unmount();
+    global.fetch.mockResolvedValueOnce({ json: () => Promise.resolve(envelope('May I have your name?', { bookingStage: 'name' })) });
+    render(<Chatbot />);
+    await say('book an appointment');
+    expect(randomUUID).toHaveBeenCalledTimes(2);
+    expect(sentBodies().at(-1).session).toBe(SESSION_2);
+    expect(document.body.innerHTML).not.toContain(SESSION_2);
+  });
 });

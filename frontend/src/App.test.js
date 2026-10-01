@@ -9,6 +9,7 @@ import { getAppointments, getProviders } from './api/client';
 // navigate away from the default Chat view, so this has no effect on them.
 jest.mock('./api/client', () => ({
   callBackend: jest.fn(),
+  startConversation: jest.fn(),
   getAppointments: jest.fn(),
   getProviders: jest.fn(),
 }));
