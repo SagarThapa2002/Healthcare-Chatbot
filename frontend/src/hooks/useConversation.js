@@ -132,6 +132,23 @@ function useConversation() {
         // pending booking instead of corrupting it with a bad field value.
         const otherIntent = detectIntent(text);
         if (INTERRUPTION_INTENTS.includes(otherIntent)) {
+          // At CONFIRM the backend already holds this conversation's pending
+          // booking (written once the slot was accepted), so discard it with
+          // the existing NoIntent before switching task - otherwise a later
+          // bare "yes" would still book the appointment we say was
+          // cancelled. Its reply is not shown; the one user-facing message is
+          // the "(Cancelled your in-progress booking.)" reply below. If the
+          // discard fails (it throws, or reports success: false), stop here:
+          // the booking stays as it was, nothing claims it was cancelled, and
+          // the interrupting intent is not sent. Earlier stages hold no
+          // backend pending state, so they need no discard.
+          if (stage === 'confirm') {
+            const discarded = await callBackend('NoIntent', {});
+            if (!discarded.success) {
+              sayEnvelope(discarded);
+              return;
+            }
+          }
           setBooking(EMPTY_BOOKING);
           const parameters = otherIntent === 'Symptom Check' ? { symptom: text } : {};
           const envelope = await callBackend(otherIntent, parameters);

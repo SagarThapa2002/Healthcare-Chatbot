@@ -977,3 +977,194 @@ describe('conversation session lifecycle', () => {
     expect(startConversation).toHaveBeenCalledTimes(2);
   });
 });
+
+// Interrupting a booking at CONFIRM: the backend already holds the pending
+// booking, so the frontend discards it with NoIntent {} before switching task.
+// Earlier stages hold no backend pending state and send no NoIntent.
+describe('interrupting a booking discards the backend pending booking only at CONFIRM', () => {
+  const DISCARD_REPLY = 'No problem! Appointment booking has been canceled.';
+
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  async function bookThroughToConfirmStage(result) {
+    await bookThroughToSlotStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, '10:00');
+  }
+
+  function intentsSent() {
+    return callBackend.mock.calls.map(([intent]) => intent);
+  }
+
+  function botTexts(result) {
+    return result.current.messages.filter((m) => m.sender === 'bot').map((m) => m.content.text);
+  }
+
+  test.each([
+    ['View Appointments', 'view my appointments', {}],
+    ['Symptom Check', 'I have a headache', { symptom: 'I have a headache' }],
+    ['Cancel Appointment', 'cancel my appointment', {}],
+    ['Update Appointment', 'update my appointment', {}],
+  ])('at CONFIRM, %s sends NoIntent {} first, then the interrupting intent', async (intent, message, params) => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToConfirmStage(result);
+    const before = callBackend.mock.calls.length;
+
+    callBackend
+      .mockResolvedValueOnce(envelopeWithText(DISCARD_REPLY))
+      .mockResolvedValueOnce(envelopeWithText('Interrupting reply'));
+    await submitMessage(result, message);
+
+    expect(callBackend.mock.calls.slice(before)).toEqual([['NoIntent', {}], [intent, params]]);
+    // The discard's reply is never shown; only the prefixed interruption reply is.
+    expect(botTexts(result)).not.toContain(DISCARD_REPLY);
+    expect(botTexts(result).at(-1)).toBe('(Cancelled your in-progress booking.) Interrupting reply');
+  });
+
+  test('the interrupting intent is sent only after NoIntent has completed', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToConfirmStage(result);
+    const before = callBackend.mock.calls.length;
+
+    let finishDiscard;
+    callBackend
+      .mockReturnValueOnce(new Promise((resolve) => { finishDiscard = resolve; }))
+      .mockResolvedValueOnce(envelopeWithText('Here are your appointments.'));
+
+    act(() => {
+      result.current.setUserInput('view my appointments');
+    });
+    let sending;
+    act(() => {
+      sending = result.current.sendMessage({ preventDefault: () => {} });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(callBackend.mock.calls.slice(before)).toEqual([['NoIntent', {}]]);
+
+    await act(async () => {
+      finishDiscard(envelopeWithText(DISCARD_REPLY));
+      await sending;
+    });
+    expect(intentsSent().slice(before)).toEqual(['NoIntent', 'View Appointments']);
+  });
+
+  test('a later bare "yes" is a plain YesIntent {} once the booking was interrupted at CONFIRM', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToConfirmStage(result);
+    callBackend
+      .mockResolvedValueOnce(envelopeWithText(DISCARD_REPLY))
+      .mockResolvedValueOnce(envelopeWithText('Here are your appointments.'));
+    await submitMessage(result, 'view my appointments');
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('There is no appointment pending confirmation.'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
+
+  test.each([
+    ['name', async (result) => {
+      callBackend.mockResolvedValueOnce(envelopeWithText('Sure, may I have your name?', 'name'));
+      await submitMessage(result, 'book an appointment');
+    }],
+    ['provider', bookThroughToProviderStage],
+    ['date', async (result) => {
+      await bookThroughToProviderStage(result);
+      callBackend.mockResolvedValueOnce(envelopeWithText('What date?', 'date'));
+      await submitMessage(result, 'dr-patel');
+    }],
+    ['slot', bookThroughToSlotStage],
+  ])('at the %s stage, an interruption sends no NoIntent', async (_stage, reachStage) => {
+    const { result } = renderHook(() => useConversation());
+    await reachStage(result);
+    const before = callBackend.mock.calls.length;
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are your appointments.'));
+    await submitMessage(result, 'view my appointments');
+
+    expect(callBackend.mock.calls.slice(before)).toEqual([['View Appointments', {}]]);
+    expect(intentsSent()).not.toContain('NoIntent');
+    expect(botTexts(result).at(-1)).toBe('(Cancelled your in-progress booking.) Here are your appointments.');
+  });
+
+  test('if NoIntent fails (rejects), the interrupting intent is not sent and nothing claims a cancellation', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToConfirmStage(result);
+    const before = callBackend.mock.calls.length;
+
+    callBackend.mockRejectedValueOnce(new Error('network down'));
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await submitMessage(result, 'view my appointments');
+    errorSpy.mockRestore();
+
+    expect(callBackend.mock.calls.slice(before)).toEqual([['NoIntent', {}]]);
+    expect(botTexts(result).at(-1)).toBe('Sorry, an error occurred.');
+    expect(botTexts(result).some((t) => t.includes('Cancelled your in-progress booking'))).toBe(false);
+
+    // The booking is still at CONFIRM locally, matching the backend: "yes" confirms it.
+    callBackend.mockResolvedValueOnce(envelopeWithText('Booked.', 'booked'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
+
+  test('if NoIntent reports success: false, the interrupting intent is not sent and nothing claims a cancellation', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToConfirmStage(result);
+    const before = callBackend.mock.calls.length;
+
+    callBackend.mockResolvedValueOnce({
+      success: false,
+      error: { code: 'INTERNAL_ERROR', message: 'Oops, something went wrong on the server.' },
+      messages: [],
+      context: null,
+      meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+    });
+    await submitMessage(result, 'view my appointments');
+
+    expect(callBackend.mock.calls.slice(before)).toEqual([['NoIntent', {}]]);
+    expect(botTexts(result).at(-1)).toBe('Oops, something went wrong on the server.');
+    expect(botTexts(result).some((t) => t.includes('Cancelled your in-progress booking'))).toBe(false);
+  });
+
+  test('regression: an abandoned booking is never confirmed by a later "yes" (modelled backend pending state)', async () => {
+    // A minimal stand-in for the backend's per-conversation pending booking:
+    // written at CONFIRM, discarded by NoIntent, consumed by YesIntent.
+    let pending = null;
+    const booked = [];
+    callBackend.mockImplementation(async (intent, params) => {
+      if (intent === 'Book Appointment') {
+        const stage = !params.name ? 'name' : !params.providerId ? 'provider'
+          : !params.date ? 'date' : !params.time ? 'slot' : 'confirm';
+        if (stage === 'confirm') pending = { ...params };
+        return envelopeWithText(`stage ${stage}`, stage);
+      }
+      if (intent === 'NoIntent') {
+        pending = null;
+        return envelopeWithText('discarded');
+      }
+      if (intent === 'YesIntent') {
+        if (!pending) return envelopeWithText('There is no appointment pending confirmation.');
+        booked.push(pending);
+        pending = null;
+        return envelopeWithText('Booked.', 'booked');
+      }
+      return envelopeWithText(`${intent} reply`);
+    });
+
+    const { result } = renderHook(() => useConversation());
+    for (const message of ['book an appointment', 'Sagar', 'dr-patel', '2026-12-28', '10:00']) {
+      await submitMessage(result, message);
+    }
+    expect(pending).toEqual({ name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:00' });
+
+    await submitMessage(result, 'view my appointments');
+    expect(pending).toBeNull();
+
+    await submitMessage(result, 'yes');
+    expect(booked).toEqual([]);
+    expect(intentsSent().slice(-3)).toEqual(['NoIntent', 'View Appointments', 'YesIntent']);
+  });
+});
