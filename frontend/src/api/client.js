@@ -47,7 +47,8 @@ function newSessionId() {
 
 // Starts a new conversation session. Called once per Chatbot mount (see
 // useConversation), so the session lasts exactly as long as the chat's own
-// conversation state - a remount (e.g. switching tabs) starts a new one.
+// conversation state. Chatbot stays mounted across tab switches (see
+// AppShell), so in practice that is one session per page load.
 function startConversation() {
   conversationSession = newSessionId();
 }
