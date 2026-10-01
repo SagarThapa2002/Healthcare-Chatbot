@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import os
+import time
 import uuid
 
 from backend import assistant_service
@@ -101,6 +102,106 @@ def _pending_cancellation_file():
     return _pending_path(PENDING_CANCELLATION_FILE, "pending_cancellations")
 
 
+# Pending state expires 30 minutes after its file was last written (its
+# mtime; every re-prompt rewrites the file, which restarts the clock). An
+# expired file is deleted at the start of the next webhook request, so the
+# handlers simply see no pending state - a stale "yes" can no longer act on
+# it - and abandoned conversations' files do not accumulate forever.
+_PENDING_TTL_SECONDS = 30 * 60
+
+_SESSION_PENDING_PREFIXES = ("pending_appointments", "pending_updates", "pending_cancellations")
+
+
+def _legacy_pending_files():
+    return (PENDING_FILE, PENDING_UPDATE_FILE, PENDING_CANCELLATION_FILE)
+
+
+def _pending_kind(filename):
+    """The pending kind ('pending_appointments', ...) if `filename` is exactly
+    one of the files this module writes - a legacy name, or
+    <prefix>.<canonical-uuid>.json - else None. Nothing else is ever
+    eligible for expiry, so the sweep cannot touch appointments, reminders,
+    provider data, temp files or look-alike names.
+    """
+    for legacy in _legacy_pending_files():
+        if filename == os.path.basename(legacy):
+            return os.path.splitext(filename)[0]
+    for prefix in _SESSION_PENDING_PREFIXES:
+        head = prefix + "."
+        if filename.startswith(head) and filename.endswith(".json"):
+            session = filename[len(head):-len(".json")]
+            if _parse_session(session) == session:
+                return prefix
+    return None
+
+
+def _remove_if_stale(path, now):
+    """Deletes `path` if it is older than the TTL, without ever deleting a
+    file that another request has just refreshed - and without locking.
+
+    Requests can run concurrently (Flask's dev server is threaded, and
+    nothing in the repo pins Gunicorn to one worker), so "check the age,
+    then delete the path" could delete a file rewritten in between. Instead
+    the stale-looking file is first *claimed*: atomically renamed to a
+    unique hidden name in the same directory. Pending files are only ever
+    replaced (write_json_atomic -> os.replace), never modified in place, so
+    the claimed file can no longer change - its age is then re-checked:
+    still stale -> deleted; fresh (a refresh landed before the rename) ->
+    put back with os.link, which fails rather than overwrite an even newer
+    file written since, in which case the superseded claimed copy is dropped.
+
+    Best effort: a file that is already gone is ignored, and any other
+    filesystem error is logged (pending kind and exception type only - no
+    contents, no session id) without failing the request.
+    """
+    kind = _pending_kind(os.path.basename(path))
+    try:
+        if now - os.path.getmtime(path) <= _PENDING_TTL_SECONDS:
+            return
+        claimed = os.path.join(
+            os.path.dirname(path), f".{os.path.basename(path)}.expiring.{uuid.uuid4().hex}"
+        )
+        os.rename(path, claimed)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.warning("pending state cleanup failed kind=%s exception_type=%s", kind, type(e).__name__)
+        return
+
+    try:
+        if now - os.path.getmtime(claimed) > _PENDING_TTL_SECONDS:
+            os.remove(claimed)
+            return
+        # Refreshed between the age check and the claim: restore it, unless
+        # an even newer file has already been written at `path`.
+        try:
+            os.link(claimed, path)
+        except FileExistsError:
+            pass
+        os.remove(claimed)
+    except OSError as e:
+        logger.warning("pending state cleanup failed kind=%s exception_type=%s", kind, type(e).__name__)
+
+
+def _expire_stale_pending_state():
+    """Expires this conversation's own pending files, then sweeps stale
+    pending files left behind by any other conversation (session-specific
+    or legacy) in the pending-state directory.
+    """
+    now = time.time()
+    for path in (_pending_booking_file(), _pending_update_file(), _pending_cancellation_file()):
+        _remove_if_stale(path, now)
+    for directory in {os.path.dirname(path) for path in _legacy_pending_files()}:
+        try:
+            names = os.listdir(directory)
+        except OSError as e:
+            logger.warning("pending state sweep failed exception_type=%s", type(e).__name__)
+            continue
+        for name in names:
+            if _pending_kind(name) is not None:
+                _remove_if_stale(os.path.join(directory, name), now)
+
+
 def _read_appointments_raw():
     with open(APPOINTMENTS_FILE, 'r') as f:
         return json.load(f)
@@ -127,6 +228,7 @@ def handle_webhook_request(payload, request_id=None):
     session = _parse_session(payload.get("session")) if isinstance(payload, dict) else None
     token = _current_session.set(session)
     try:
+        _expire_stale_pending_state()
         return _dispatch_webhook_request(payload, request_id=request_id)
     finally:
         _current_session.reset(token)
