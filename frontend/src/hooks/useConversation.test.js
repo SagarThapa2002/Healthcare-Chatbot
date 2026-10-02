@@ -1649,3 +1649,208 @@ describe('booking date is kept only once the backend accepts it', () => {
     });
   });
 });
+
+// The backend's final availability re-check can find the confirmed slot
+// already taken. It then discards its pending booking and reports the step
+// the booking continues from: 'slot' (same date, current times) or 'date'
+// (that day has none left). The frontend keeps the booking active at that
+// step, decided by bookingStage alone.
+describe('recovering from a final slot conflict after "yes"', () => {
+  const BOOKED_FIELDS = { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '09:00' };
+
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  // name -> provider -> date -> slot '09:00' accepted -> CONFIRM
+  async function reachConfirm(result) {
+    await bookThroughToSlotStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '09:00');
+    expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', BOOKED_FIELDS);
+  }
+
+  function yesReply(text, bookingStage) {
+    return { ...envelopeWithText(text, bookingStage), context: { intent: 'YesIntent', ...(bookingStage ? { bookingStage } : {}) } };
+  }
+
+  function lastReply(result) {
+    return result.current.messages[result.current.messages.length - 1].content.text;
+  }
+
+  test('conflict -> SLOT: booking stays active with name/provider/date, the stale time is dropped, the next input is a time', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+
+    callBackend.mockResolvedValueOnce(yesReply('Sorry, that time is no longer available... Here are the available times on 2026-12-28:', 'slot'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '10:30');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:30' }
+    );
+  });
+
+  test.each(['slot', 'date', 'booked', undefined])(
+    'one "yes" makes exactly one backend request, a single YesIntent (bookingStage %p)',
+    async (bookingStage) => {
+      const { result } = renderHook(() => useConversation());
+      await reachConfirm(result);
+      const before = callBackend.mock.calls.length;
+
+      callBackend.mockResolvedValueOnce(yesReply('reply', bookingStage));
+      await submitMessage(result, 'yes');
+
+      expect(callBackend.mock.calls.slice(before)).toEqual([['YesIntent', {}]]);
+    },
+  );
+
+  test('conflict -> SLOT -> replacement time -> CONFIRM -> "yes" books', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+    callBackend.mockResolvedValueOnce(yesReply('Sorry...', 'slot'));
+    await submitMessage(result, 'yes');
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '10:30');
+    callBackend.mockResolvedValueOnce(yesReply('Your appointment for Sagar has been booked.', 'booked'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+
+    // 'booked' ends the booking as before: the next message is ordinary routing.
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, 'What is a balanced diet?');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'What is a balanced diet?' });
+  });
+
+  test('a rejected replacement time keeps the booking at SLOT (existing slot acceptance)', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+    callBackend.mockResolvedValueOnce(yesReply('Sorry...', 'slot'));
+    await submitMessage(result, 'yes');
+
+    callBackend.mockResolvedValueOnce(envelopeWithText("Sorry, that time isn't available anymore.", 'slot'));
+    await submitMessage(result, '10:00');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '11:00');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '11:00' }
+    );
+  });
+
+  test('conflict -> DATE: provider kept, stale date and time dropped, the next input is a date and reaches SLOT', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+
+    callBackend.mockResolvedValueOnce(yesReply('Sorry... Dr. Patel is fully booked on 2026-12-28.', 'date'));
+    await submitMessage(result, 'yes');
+
+    // Not a date: the date re-prompt, without a backend call - the local step is DATE.
+    const calls = callBackend.mock.calls.length;
+    await submitMessage(result, '10:30');
+    expect(lastReply(result)).toMatch(/couldn't understand that date/);
+    expect(callBackend).toHaveBeenCalledTimes(calls);
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-30:', 'slot'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-30' }
+    );
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '09:00');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-30', time: '09:00' }
+    );
+  });
+
+  test.each([
+    ['booked', 'Your appointment for Sagar has been booked.'],
+    [undefined, 'Sorry, I couldn\'t confirm that appointment right now. Please choose another time or date.'],
+    [undefined, 'There is no appointment pending confirmation.'],
+    ['confirm', 'unexpected stage'],
+    ['provider', 'unexpected stage'],
+  ])('a "yes" reply with bookingStage %p ends the booking as before (%s)', async (bookingStage, text) => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+
+    callBackend.mockResolvedValueOnce(yesReply(text, bookingStage));
+    await submitMessage(result, 'yes');
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, '10:30');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: '10:30' });
+  });
+
+  test('bookingStage alone decides: conflict wording without a stage resets, neutral wording with "slot" recovers', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+    callBackend.mockResolvedValueOnce(yesReply('Sorry, that time is no longer available - it was just taken.', undefined));
+    await submitMessage(result, 'yes');
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, '10:30');
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: '10:30' });
+
+    const second = renderHook(() => useConversation()).result;
+    await reachConfirm(second);
+    callBackend.mockResolvedValueOnce(yesReply('Okay.', 'slot'));
+    await submitMessage(second, 'yes');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(second, '10:30');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:30' }
+    );
+  });
+
+  test.each([
+    ['view my appointments', 'View Appointments'],
+    ['cancel my appointment', 'Cancel Appointment'],
+    ['update my appointment', 'Update Appointment'],
+  ])('an interruption after a conflict ("%s") sends no NoIntent - nothing is pending on the backend', async (text, intent) => {
+    const { result } = renderHook(() => useConversation());
+    await reachConfirm(result);
+    callBackend.mockResolvedValueOnce(yesReply('Sorry...', 'slot'));
+    await submitMessage(result, 'yes');
+    const calls = callBackend.mock.calls.length;
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, text);
+
+    expect(callBackend.mock.calls.slice(calls)).toEqual([[intent, {}]]);
+  });
+
+  test('rendered: the conflict reply\'s slot chips are shown, and clicking one sends that time with the kept fields', async () => {
+    const slots = [
+      { id: '09:30', label: '09:30', value: '09:30' },
+      { id: '10:30', label: '10:30', value: '10:30' },
+    ];
+    const typeAndSubmit = async (value) => {
+      await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+      fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+      fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    };
+    callBackend
+      .mockResolvedValueOnce(envelopeWithText('May I have your name?', 'name'))
+      .mockResolvedValueOnce(envelopeWithText('Which provider?', 'provider'))
+      .mockResolvedValueOnce(envelopeWithText('What date?', 'date'))
+      .mockResolvedValueOnce(envelopeWithText('Available times', 'slot'))
+      .mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'))
+      .mockResolvedValueOnce({
+        ...yesReply('Sorry, that time is no longer available. Here are the available times on 2026-12-28:', 'slot'),
+        messages: [{ type: 'text', content: { text: 'Sorry... Here are the available times on 2026-12-28:' }, suggestions: slots }],
+      })
+      .mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'));
+    render(<Chatbot />);
+    for (const value of ['book an appointment', 'Sagar', 'dr-patel', '2026-12-28', '09:00', 'yes']) {
+      // eslint-disable-next-line no-await-in-loop
+      await typeAndSubmit(value);
+    }
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {}));
+
+    fireEvent.click(await screen.findByRole('button', { name: '10:30' }));
+    await waitFor(() => expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:30' }
+    ));
+  });
+});

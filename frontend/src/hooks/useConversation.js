@@ -155,9 +155,19 @@ function useConversation() {
       if (stage) {
         const answer = text.trim().toLowerCase();
 
+        // A "yes" normally ends the booking ('booked', or a failure that
+        // reports no bookingStage). The one exception is the backend's final
+        // availability re-check finding the slot already taken: it then
+        // reports the step the booking continues from - 'slot' (same date,
+        // the current times) or 'date' (that day has none left) - and the
+        // booking stays active at that step, keeping only the fields before
+        // it (acceptedBooking), so the user's replacement goes out as a time
+        // or a date. Decided by bookingStage alone, never the reply text.
         if (stage === 'confirm' && answer === 'yes') {
-          sayEnvelope(await callBackend('YesIntent', {}));
-          setBooking(EMPTY_BOOKING);
+          const envelope = await callBackend('YesIntent', {});
+          const reportedStage = envelope.context?.bookingStage;
+          sayEnvelope(envelope);
+          setBooking(acceptedBooking(booking, reportedStage, ['slot', 'date']) || EMPTY_BOOKING);
           return;
         }
         if (stage === 'confirm' && answer === 'no') {
