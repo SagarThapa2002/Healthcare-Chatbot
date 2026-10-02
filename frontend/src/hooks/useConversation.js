@@ -94,6 +94,13 @@ function acceptedBooking(attempted, reportedStage, acceptingStages) {
   return kept;
 }
 
+// KEEP_STEP_ON_ERROR: a reply with success: false (a backend INTERNAL_ERROR,
+// or CLIENT_ERROR for an unreadable body) means the request reached the
+// backend but its outcome is unknown - a pending booking, cancellation or
+// update may still exist there. So the booking/cancellation/update confirm
+// steps, and the cancellation/update identifier and fields steps, keep their
+// current step on such a reply (its message is still shown), and the user can
+// retry or leave exactly as before. The interruption NoIntent call does the same.
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
@@ -175,11 +182,14 @@ function useConversation() {
           const envelope = await callBackend('YesIntent', {});
           const reportedStage = envelope.context?.bookingStage;
           sayEnvelope(envelope);
+          if (!envelope.success) return; // outcome unknown: stay at CONFIRM (see KEEP_STEP_ON_ERROR)
           setBooking(acceptedBooking(booking, reportedStage, ['slot', 'date']) || EMPTY_BOOKING);
           return;
         }
         if (stage === 'confirm' && answer === 'no') {
-          sayEnvelope(await callBackend('NoIntent', {}));
+          const envelope = await callBackend('NoIntent', {});
+          sayEnvelope(envelope);
+          if (!envelope.success) return;
           setBooking(EMPTY_BOOKING);
           return;
         }
@@ -350,14 +360,16 @@ function useConversation() {
 
         if (answer === 'yes') {
           const envelope = await callBackend('YesIntent', {});
-          setCancellationStage(envelope.context?.cancellationStage ?? null);
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
           return;
         }
         if (answer === 'no') {
           const envelope = await callBackend('NoIntent', {});
-          setCancellationStage(envelope.context?.cancellationStage ?? null);
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
           return;
         }
 
@@ -381,8 +393,9 @@ function useConversation() {
           const trimmed = text.trim();
           const parameters = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
           const envelope = await callBackend('Cancel Appointment', parameters);
-          setCancellationStage(envelope.context?.cancellationStage ?? null);
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setCancellationStage(envelope.context?.cancellationStage ?? null);
           return;
         }
         // A different task: leave the cancellation and route this message
@@ -401,14 +414,16 @@ function useConversation() {
 
         if (answer === 'yes') {
           const envelope = await callBackend('YesIntent', {});
-          setUpdate(deriveUpdateState(envelope, update.identifier));
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setUpdate(deriveUpdateState(envelope, update.identifier));
           return;
         }
         if (answer === 'no') {
           const envelope = await callBackend('NoIntent', {});
-          setUpdate(deriveUpdateState(envelope, update.identifier));
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setUpdate(deriveUpdateState(envelope, update.identifier));
           return;
         }
 
@@ -444,8 +459,9 @@ function useConversation() {
           if (date) parameters.date = date;
           if (time) parameters.time = time;
           const envelope = await callBackend('Update Appointment', parameters);
-          setUpdate(deriveUpdateState(envelope, update.identifier));
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setUpdate(deriveUpdateState(envelope, update.identifier));
           return;
         }
         // A different task: leave the update and route this message normally below.
@@ -468,8 +484,9 @@ function useConversation() {
           const trimmed = text.trim();
           const identifierParams = UUID_PATTERN.test(trimmed) ? { id: trimmed } : { name: trimmed };
           const envelope = await callBackend('Update Appointment', identifierParams);
-          setUpdate(deriveUpdateState(envelope, identifierParams));
           sayEnvelope(envelope);
+          if (!envelope.success) return;
+          setUpdate(deriveUpdateState(envelope, identifierParams));
           return;
         }
         // A different task: leave the update and route this message normally below.

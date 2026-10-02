@@ -2103,3 +2103,239 @@ describe('transport failure banner (rendered Chatbot)', () => {
   // The rendered timeout case is covered end to end (a real request aborted
   // by fetchWithTimeout) in client.test.js.
 });
+
+// A structured `success: false` reply (backend INTERNAL_ERROR, or the
+// client's CLIENT_ERROR for an unreadable body) means the request reached
+// the backend but its outcome is unknown - a pending booking, cancellation
+// or update may still exist there. The frontend keeps its current step so
+// the user can retry "yes"/"no" (or interrupt) against that same state.
+// Whether a step was kept is shown by how the NEXT message is routed, never
+// by the backend's error text.
+describe('structured success: false keeps the current step (outcome unknown)', () => {
+  const ID = 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d';
+  const INTERNAL_ERROR = {
+    success: false,
+    error: { code: 'INTERNAL_ERROR', message: 'Oops, something went wrong on the server.' },
+    messages: [],
+    context: null,
+    meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+  };
+  // What normalizeResponse produces for an unreadable 200 body.
+  const CLIENT_ERROR = {
+    success: false,
+    error: { code: 'CLIENT_ERROR', message: 'Sorry, an error occurred.' },
+    messages: [{ type: 'text', content: { text: 'Sorry, an error occurred.' }, suggestions: [] }],
+    context: null,
+    meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+  };
+
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  function callsAfter(before) {
+    return callBackend.mock.calls.slice(before);
+  }
+
+  async function reachBookingConfirm(result) {
+    await bookThroughToSlotStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, '10:00');
+  }
+
+  async function reachCancellationIdentifier(result) {
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("What's the ID or name?", 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+  }
+
+  async function reachCancellationConfirm(result) {
+    await reachCancellationIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, ID);
+  }
+
+  async function reachUpdateIdentifier(result) {
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("What's the ID or name?", 'identifier'));
+    await submitMessage(result, 'update my appointment');
+  }
+
+  async function reachUpdateFields(result) {
+    await reachUpdateIdentifier(result);
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What new date or time?', 'fields'));
+    await submitMessage(result, ID);
+  }
+
+  async function reachUpdateConfirm(result) {
+    await reachUpdateFields(result);
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+  }
+
+  // At a confirm step, text that is neither yes/no nor a task is re-prompted
+  // locally with no backend request; without a step it would be sent as a
+  // General FAQ question.
+  async function expectStillAtConfirm(result) {
+    const before = callBackend.mock.calls.length;
+    await submitMessage(result, 'hmm');
+    expect(callsAfter(before)).toEqual([]);
+  }
+
+  describe('booking CONFIRM', () => {
+    test.each(['yes', 'no'])('"%s" + success: false keeps CONFIRM (no backend request for other text)', async (answer) => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, answer);
+      expect(callBackend).toHaveBeenLastCalledWith(answer === 'yes' ? 'YesIntent' : 'NoIntent', {});
+
+      await expectStillAtConfirm(result);
+    });
+
+    test('after an error, a retried "yes" sends YesIntent again and "booked" completes as before', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'yes');
+
+      const before = callBackend.mock.calls.length;
+      callBackend.mockResolvedValueOnce(envelopeWithText('Your appointment for Sagar has been booked.', 'booked'));
+      await submitMessage(result, 'yes');
+      expect(callsAfter(before)).toEqual([['YesIntent', {}]]);
+
+      callBackend.mockResolvedValueOnce(fakeEnvelope());
+      await submitMessage(result, '10:30');
+      expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: '10:30' });
+    });
+
+    test('after an error, a retried "no" sends NoIntent and ends the booking as before', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'yes');
+
+      callBackend.mockResolvedValueOnce(fakeEnvelope());
+      await submitMessage(result, 'no');
+      expect(callBackend).toHaveBeenLastCalledWith('NoIntent', {});
+
+      callBackend.mockResolvedValueOnce(fakeEnvelope());
+      await submitMessage(result, '10:30');
+      expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: '10:30' });
+    });
+
+    test('after an error, an interruption first discards the pending booking with NoIntent', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'no');
+
+      const before = callBackend.mock.calls.length;
+      callBackend.mockResolvedValueOnce(fakeEnvelope()).mockResolvedValueOnce(fakeEnvelope());
+      await submitMessage(result, 'view my appointments');
+      expect(callsAfter(before)).toEqual([['NoIntent', {}], ['View Appointments', {}]]);
+    });
+
+    test('a retried "yes" answered with no bookingStage ("nothing pending") resets as before', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'yes');
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('There is no appointment pending confirmation.', undefined));
+      await submitMessage(result, 'yes');
+
+      callBackend.mockResolvedValueOnce(fakeEnvelope());
+      await submitMessage(result, '10:30');
+      expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: '10:30' });
+    });
+
+    test('a CLIENT_ERROR (unreadable reply) is treated the same: CONFIRM is kept', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachBookingConfirm(result);
+
+      callBackend.mockResolvedValueOnce(CLIENT_ERROR);
+      await submitMessage(result, 'yes');
+
+      await expectStillAtConfirm(result);
+    });
+  });
+
+  describe('cancellation', () => {
+    test.each(['yes', 'no'])('CONFIRM "%s" + success: false keeps CONFIRM, and the retry is a cancellation answer', async (answer) => {
+      const { result } = renderHook(() => useConversation());
+      await reachCancellationConfirm(result);
+
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, answer);
+      await expectStillAtConfirm(result);
+
+      callBackend.mockResolvedValueOnce(envelopeWithCancellation('Done.', answer === 'yes' ? 'cancelled' : undefined));
+      await submitMessage(result, answer);
+      expect(callBackend).toHaveBeenLastCalledWith(answer === 'yes' ? 'YesIntent' : 'NoIntent', {});
+    });
+
+    test('IDENTIFIER + success: false keeps IDENTIFIER: the retry is sent as an identifier again', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachCancellationIdentifier(result);
+
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'Sagar');
+
+      callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm (yes or no)', 'confirm'));
+      await submitMessage(result, 'Sagar');
+      expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
+    });
+  });
+
+  describe('update', () => {
+    test.each(['yes', 'no'])('CONFIRM "%s" + success: false keeps CONFIRM, and the retry is an update answer', async (answer) => {
+      const { result } = renderHook(() => useConversation());
+      await reachUpdateConfirm(result);
+
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, answer);
+      await expectStillAtConfirm(result);
+
+      callBackend.mockResolvedValueOnce(envelopeWithUpdate('Done.', answer === 'yes' ? 'updated' : undefined));
+      await submitMessage(result, answer);
+      expect(callBackend).toHaveBeenLastCalledWith(answer === 'yes' ? 'YesIntent' : 'NoIntent', {});
+    });
+
+    test('IDENTIFIER + success: false keeps IDENTIFIER: the retry is sent as an identifier again', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachUpdateIdentifier(result);
+
+      callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+      await submitMessage(result, 'Sagar');
+
+      callBackend.mockResolvedValueOnce(envelopeWithUpdate('What new date or time?', 'fields'));
+      await submitMessage(result, 'Sagar');
+      expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { name: 'Sagar' });
+    });
+
+    test('FIELDS + success: false keeps FIELDS and the identifier: the retry carries the same id', async () => {
+      const { result } = renderHook(() => useConversation());
+      await reachUpdateFields(result);
+
+      callBackend.mockResolvedValueOnce(CLIENT_ERROR);
+      await submitMessage(result, '2026-12-30');
+
+      callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm (yes or no)', 'confirm'));
+      await submitMessage(result, '2026-12-30 at 11:00');
+      expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { id: ID, date: '2026-12-30', time: '11:00' });
+    });
+  });
+
+  test('the error is still shown as an assistant message, not as the transport error banner', async () => {
+    const { result } = renderHook(() => useConversation());
+    await reachBookingConfirm(result);
+
+    callBackend.mockResolvedValueOnce(INTERNAL_ERROR);
+    await submitMessage(result, 'yes');
+
+    const last = result.current.messages[result.current.messages.length - 1];
+    expect(last.sender).toBe('bot');
+    expect(last.content.text).toBe(INTERNAL_ERROR.error.message);
+    expect(result.current.error).toBeNull();
+  });
+});
