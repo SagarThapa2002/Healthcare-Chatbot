@@ -70,6 +70,28 @@ function leaveBeforeConfirm(text, currentFlowIntent) {
   return TASK_SWITCH_INTENTS.includes(intent) && intent !== currentFlowIntent ? 'switch' : null;
 }
 
+// The booking fields in the order the backend asks for them, each keyed by
+// the bookingStage that asks for it.
+const BOOKING_STAGE_FIELDS = [['name', 'name'], ['provider', 'providerId'], ['date', 'date'], ['slot', 'time']];
+
+// What to keep of an attempted booking once the backend has replied. The
+// reported bookingStage names the first field the backend still needs, so
+// that field and every later one are dropped - rejected, or not checked
+// yet - and the earlier ones are kept as accepted ('confirm' keeps them
+// all). Returns null unless the reply is one of `acceptingStages`, so a
+// rejected, unknown or missing stage keeps the previous booking (fails
+// closed).
+function acceptedBooking(attempted, reportedStage, acceptingStages) {
+  if (!acceptingStages.includes(reportedStage)) return null;
+  const firstNeeded = BOOKING_STAGE_FIELDS.findIndex(([stage]) => stage === reportedStage);
+  if (firstNeeded === -1) return attempted;
+  const kept = { ...attempted };
+  BOOKING_STAGE_FIELDS.slice(firstNeeded).forEach(([, field]) => {
+    kept[field] = null;
+  });
+  return kept;
+}
+
 function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
@@ -215,14 +237,17 @@ function useConversation() {
         // response_model.success_response's docstring), so this never
         // has to infer acceptance from response text or `success` (which
         // only means the request was processed, not that the provider
-        // was valid). Checked against the exact expected next stage
-        // ('date'), not merely "not 'provider'" - so an unexpected,
-        // unknown, or future stage value fails closed (treated as
-        // rejected) rather than accidentally counting as acceptance. If
-        // the backend is still at 'provider' (rejected), `booking` is
-        // left exactly as it was, so the next reply is still correctly
-        // treated as another provider attempt - not misread as a date,
-        // which is the exact bug this closes.
+        // was valid). Only a later known stage ('date', 'slot' or
+        // 'confirm') counts as acceptance, so an unexpected, unknown, or
+        // future stage value fails closed (treated as rejected). If the
+        // backend is still at 'provider' (rejected), `booking` is left
+        // exactly as it was, so the next reply is still correctly treated
+        // as another provider attempt - not misread as a date. A
+        // one-sentence start may already carry a date and time: on
+        // acceptance, acceptedBooking keeps only what the backend has
+        // accepted, so a date it rejected ('date' reported) is dropped
+        // with its time, instead of leaving every field set and the local
+        // stage at 'confirm' while the backend asks for a new date.
         if (stage === 'provider') {
           if (!text.trim()) {
             sayText("Please tell me which provider you'd like to see.");
@@ -231,21 +256,28 @@ function useConversation() {
           const attempted = { ...booking, providerId: text.trim() };
           const envelope = await callBackend('Book Appointment', bookingParams(attempted));
           const reportedStage = envelope.context?.bookingStage;
-          const providerAccepted = reportedStage === 'date';
-          setBooking(providerAccepted ? attempted : booking);
+          setBooking(acceptedBooking(attempted, reportedStage, ['date', 'slot', 'confirm']) || booking);
           sayEnvelope(envelope);
           return;
         }
 
+        // Same rule for the date: a well-formed date is sent, but only
+        // kept once the backend moves past 'date'. The backend stays at
+        // 'date' when it rejects one (provider not working that day, past
+        // date, fully booked...), and keeping it anyway would put the
+        // local stage at 'slot', sending the user's next date as a time
+        // alongside the rejected date.
         if (stage === 'date') {
           const date = parseDate(text);
           if (!date) {
             sayText('I couldn\'t understand that date. Try a format like 2026-12-26, 26-12-2026, or "26 December 2026".');
             return;
           }
-          const next = { ...booking, date };
-          setBooking(next);
-          sayEnvelope(await callBackend('Book Appointment', bookingParams(next)));
+          const attempted = { ...booking, date };
+          const envelope = await callBackend('Book Appointment', bookingParams(attempted));
+          const reportedStage = envelope.context?.bookingStage;
+          setBooking(acceptedBooking(attempted, reportedStage, ['slot', 'confirm']) || booking);
+          sayEnvelope(envelope);
           return;
         }
 

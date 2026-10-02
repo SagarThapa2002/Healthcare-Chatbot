@@ -1429,3 +1429,223 @@ describe('leaving cancel/update flows before confirmation', () => {
     expect(callsSince(before)).toEqual([['NoIntent', {}]]);
   });
 });
+
+// The backend stays at bookingStage 'date' when it rejects a date (the
+// provider doesn't work that day, a past date, a fully booked day...). A
+// rejected date must not be kept: the next date the user types has to go
+// out as a new `date`, not as a `time` alongside the rejected one.
+describe('booking date is kept only once the backend accepts it', () => {
+  const REJECTED = "Dr. Patel isn't available that day. They're typically available on: Monday, Wednesday.";
+
+  beforeEach(() => {
+    callBackend.mockReset();
+  });
+
+  // name -> provider accepted -> now at DATE
+  async function bookThroughToDateStage(result) {
+    await bookThroughToProviderStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText('What date would you like to see Dr. Patel?', 'date'));
+    await submitMessage(result, 'dr-patel');
+  }
+
+  function lastReply(result) {
+    return result.current.messages[result.current.messages.length - 1].content.text;
+  }
+
+  test('regression: after a rejected date, the replacement date is sent as `date`, not as `time`', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+
+    callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+    await submitMessage(result, '2026-12-29');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-29' }
+    );
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-30:', 'slot'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-30' }
+    );
+    expect(callBackend).not.toHaveBeenCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-29', time: '2026-12-30' }
+    );
+    expect(callBackend).not.toHaveBeenCalledWith(
+      'Book Appointment', expect.objectContaining({ time: expect.anything() })
+    );
+  });
+
+  test('a rejected date leaves the conversation at DATE: non-date text gets the date re-prompt, not a time attempt', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+    await submitMessage(result, '2026-12-29');
+    const callsAfterRejection = callBackend.mock.calls.length;
+
+    await submitMessage(result, '10:00');
+
+    expect(lastReply(result)).toMatch(/couldn't understand that date/);
+    expect(callBackend).toHaveBeenCalledTimes(callsAfterRejection);
+  });
+
+  test('an accepted date advances to SLOT and is kept: the next reply is sent as `time` with that date', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-28:', 'slot'));
+    await submitMessage(result, '2026-12-28');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '10:00');
+
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:00' }
+    );
+  });
+
+  test('several rejected dates, then an accepted one, still complete the normal flow', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+
+    for (const date of ['2026-12-29', '2026-12-31']) {
+      callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+      // eslint-disable-next-line no-await-in-loop
+      await submitMessage(result, date);
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date });
+    }
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-28:', 'slot'));
+    await submitMessage(result, '2026-12-28');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28' }
+    );
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '10:00');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:00' }
+    );
+    callBackend.mockResolvedValueOnce(envelopeWithText('Your appointment for Sagar has been booked.', 'booked'));
+    await submitMessage(result, 'yes');
+    expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+  });
+
+  test.each([
+    ['view my appointments', 'View Appointments'],
+    ['cancel my appointment', 'Cancel Appointment'],
+  ])('an interruption after a rejected date ("%s") sends no NoIntent - nothing is pending on the backend', async (text, intent) => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+    await submitMessage(result, '2026-12-29');
+    const callsAfterRejection = callBackend.mock.calls.length;
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await submitMessage(result, text);
+
+    expect(callBackend.mock.calls.slice(callsAfterRejection)).toEqual([[intent, {}]]);
+    expect(callBackend).not.toHaveBeenCalledWith('NoIntent', expect.anything());
+  });
+
+  test('"book an appointment" after a rejected date is handled as at any DATE step: a date re-prompt, no backend call', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+    callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+    await submitMessage(result, '2026-12-29');
+    const callsAfterRejection = callBackend.mock.calls.length;
+
+    await submitMessage(result, 'book an appointment');
+
+    expect(callBackend).toHaveBeenCalledTimes(callsAfterRejection);
+    expect(lastReply(result)).toMatch(/couldn't understand that date/);
+  });
+
+  test('acceptance follows bookingStage only, never the reply text or `success`', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+
+    // Text that reads like acceptance, but the backend is still at 'date': rejected.
+    callBackend.mockResolvedValueOnce(envelopeWithText('Great, 2026-12-29 works! Here are the available times:', 'date'));
+    await submitMessage(result, '2026-12-29');
+    // Text that reads like a rejection, but the backend moved on to 'slot': accepted.
+    callBackend.mockResolvedValueOnce(envelopeWithText("Sorry, that date isn't available.", 'slot'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-30' }
+    );
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+    await submitMessage(result, '10:00');
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-30', time: '10:00' }
+    );
+  });
+
+  test('a reply with no bookingStage keeps the previous booking (fails closed)', async () => {
+    const { result } = renderHook(() => useConversation());
+    await bookThroughToDateStage(result);
+
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-29:', undefined));
+    await submitMessage(result, '2026-12-29');
+    callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-28:', 'slot'));
+    await submitMessage(result, '2026-12-28');
+
+    expect(callBackend).toHaveBeenLastCalledWith(
+      'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28' }
+    );
+  });
+
+  describe('one-sentence booking start (date and time extracted up front)', () => {
+    const SENTENCE = 'book appointment for Sagar on 26 December 2026 at 10am';
+    const EXTRACTED = { name: 'Sagar', date: '2026-12-26', time: '10:00' };
+
+    async function startOneSentenceBooking(result) {
+      callBackend.mockResolvedValueOnce(envelopeWithText('Thanks Sagar. Which provider would you like to see?', 'provider'));
+      await submitMessage(result, SENTENCE);
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', EXTRACTED);
+    }
+
+    test('regression: provider accepted but date rejected - provider kept, stale date and time dropped, next input is a new date', async () => {
+      const { result } = renderHook(() => useConversation());
+      await startOneSentenceBooking(result);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText(REJECTED, 'date'));
+      await submitMessage(result, 'dr-patel');
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { ...EXTRACTED, providerId: 'dr-patel' });
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times on 2026-12-28:', 'slot'));
+      await submitMessage(result, '2026-12-28');
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28' }
+      );
+      expect(lastReply(result)).toBe('Here are the available times on 2026-12-28:');
+      expect(result.current.messages.map((m) => m.content?.text)).not.toContain(
+        'Please reply "yes" to confirm the appointment, or "no" to cancel it.'
+      );
+    });
+
+    test('provider and date accepted - the booking reaches CONFIRM and "yes" sends YesIntent', async () => {
+      const { result } = renderHook(() => useConversation());
+      await startOneSentenceBooking(result);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm — book appointment with Dr. Patel... (yes or no)', 'confirm'));
+      await submitMessage(result, 'dr-patel');
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { ...EXTRACTED, providerId: 'dr-patel' });
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Your appointment for Sagar has been booked.', 'booked'));
+      await submitMessage(result, 'yes');
+      expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+    });
+
+    test('provider and date accepted but the time taken - date kept, next input is sent as the new time', async () => {
+      const { result } = renderHook(() => useConversation());
+      await startOneSentenceBooking(result);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText("Sorry, that time isn't available anymore.", 'slot'));
+      await submitMessage(result, 'dr-patel');
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm... (yes or no)', 'confirm'));
+      await submitMessage(result, '11:00');
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-26', time: '11:00' }
+      );
+    });
+  });
+});
