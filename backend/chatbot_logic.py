@@ -1564,7 +1564,9 @@ def _handle_view_appointments():
                     if a.get('id'):
                         line += f" (ID: {a['id']})"
                     response_lines.append(line)
-                text = "Here’s a quick look at your scheduled appointments:\n" + "\n".join(response_lines)
+                # Neutral wording: every visitor sees every active
+                # appointment (there is no ownership or authentication).
+                text = "Here are the scheduled appointments:\n" + "\n".join(response_lines)
             else:
                 text = "You don't have any appointments booked at the moment."
         except json.JSONDecodeError:

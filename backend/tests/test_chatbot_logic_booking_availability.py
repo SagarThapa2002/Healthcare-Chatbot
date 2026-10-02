@@ -1216,6 +1216,43 @@ class CancellationFlowTest(BookingFlowTestCase):
         text = response["messages"][0]["content"]["text"]
         self.assertIn(appointment["id"], text)
 
+    def test_listing_uses_neutral_wording_and_keeps_its_line_format(self):
+        # Appointments are not owned by a visitor, so the heading must not
+        # say "your". The lines themselves are unchanged: name, date, time,
+        # and the ID when the record has one (legacy records have none).
+        first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
+        records = self._read_appointments()
+        records.append({"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"})
+        with open(self.appointments_file, 'w') as f:
+            json.dump(records, f)
+
+        response = self.post_webhook("View Appointments").get_json()
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["context"], {"intent": "View Appointments"})
+        self.assertEqual(len(response["messages"]), 1)
+        message = response["messages"][0]
+        self.assertEqual(message["type"], "text")
+        self.assertEqual(message["suggestions"], [])
+        self.assertEqual(
+            message["content"]["text"],
+            "Here are the scheduled appointments:\n"
+            f"First Patient on 2026-12-28 at 10:00 (ID: {first['id']})\n"
+            "Legacy Patient on 2026-01-01 at 09:00",
+        )
+        self.assertNotIn("your", message["content"]["text"].lower())
+
+    def test_empty_listing_text_is_unchanged(self):
+        with open(self.appointments_file, 'w') as f:
+            json.dump([], f)
+
+        response = self.post_webhook("View Appointments").get_json()
+
+        self.assertEqual(
+            response["messages"][0]["content"]["text"],
+            "You don't have any appointments booked at the moment.",
+        )
+
     def test_already_cancelled_before_confirmation_does_not_affect_another_appointment(self):
         first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
         second = self._book_and_confirm(name="Second Patient", date="2026-12-28", time="10:30")
