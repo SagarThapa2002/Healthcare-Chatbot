@@ -53,15 +53,41 @@ function startConversation() {
   conversationSession = newSessionId();
 }
 
+// Longest a request may take, start to finish, before it is aborted - a
+// few seconds above the backend's own 30 s limits (LLM call, Gunicorn
+// worker), so a slow but legitimate answer is not cut off. Without it a
+// stalled connection would leave the chat input disabled indefinitely.
+const REQUEST_TIMEOUT_MS = 35 * 1000;
+
+// fetch() with that timeout. The timer covers the whole request including
+// reading the body (`read` runs before it is cleared, and the same signal
+// aborts a body read in progress), and is always cleared once the request
+// settles - resolved, rejected or aborted. A timeout surfaces as the
+// rejection fetch raises on abort, through each caller's existing error
+// handling; nothing else about the request changes.
+async function fetchWithTimeout(url, options, read) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return await read(response);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function callBackend(intent, parameters) {
   const queryResult = { intent: { displayName: intent }, parameters };
   const payload = conversationSession ? { session: conversationSession, queryResult } : { queryResult };
-  const response = await fetch(`${API_BASE_URL}/webhook/webhook`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json();
+  const data = await fetchWithTimeout(
+    `${API_BASE_URL}/webhook/webhook`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    (response) => response.json(),
+  );
   return normalizeResponse(data);
 }
 
@@ -71,11 +97,12 @@ async function callBackend(intent, parameters) {
 // a non-OK response so callers can distinguish "request failed" from "no
 // appointments" (an empty array is a valid, successful response).
 async function getAppointments() {
-  const response = await fetch(`${API_BASE_URL}/webhook/appointments`);
-  if (!response.ok) {
-    throw new Error(`Failed to load appointments (status ${response.status})`);
-  }
-  return response.json();
+  return fetchWithTimeout(`${API_BASE_URL}/webhook/appointments`, {}, (response) => {
+    if (!response.ok) {
+      throw new Error(`Failed to load appointments (status ${response.status})`);
+    }
+    return response.json();
+  });
 }
 
 // GET /webhook/providers returns the raw provider array as-is (see
@@ -83,11 +110,12 @@ async function getAppointments() {
 // envelope, same as getAppointments above, and throws on a non-OK
 // response the same way.
 async function getProviders() {
-  const response = await fetch(`${API_BASE_URL}/webhook/providers`);
-  if (!response.ok) {
-    throw new Error(`Failed to load providers (status ${response.status})`);
-  }
-  return response.json();
+  return fetchWithTimeout(`${API_BASE_URL}/webhook/providers`, {}, (response) => {
+    if (!response.ok) {
+      throw new Error(`Failed to load providers (status ${response.status})`);
+    }
+    return response.json();
+  });
 }
 
 export { callBackend, getAppointments, getProviders, resolveApiBaseUrl, startConversation };

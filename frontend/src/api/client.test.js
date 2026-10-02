@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { webcrypto } from 'crypto';
 import { getProviders, resolveApiBaseUrl } from './client';
 import Chatbot from '../components/Chatbot';
@@ -22,7 +22,7 @@ describe('getProviders', () => {
 
     await expect(getProviders()).resolves.toEqual(providers);
     expect(global.fetch).toHaveBeenCalledTimes(1);
-    expect(global.fetch).toHaveBeenCalledWith('http://127.0.0.1:5000/webhook/providers');
+    expect(global.fetch).toHaveBeenCalledWith('http://127.0.0.1:5000/webhook/providers', { signal: expect.any(AbortSignal) });
   });
 
   test('throws on a non-OK response rather than returning an error body', async () => {
@@ -116,6 +116,7 @@ describe.each([
       body: JSON.stringify({
         queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
       }),
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -125,7 +126,7 @@ describe.each([
     await client.getAppointments();
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
-    expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/appointments`);
+    expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/appointments`, { signal: expect.any(AbortSignal) });
   });
 
   test('getProviders requests /webhook/providers', async () => {
@@ -134,7 +135,7 @@ describe.each([
     await client.getProviders();
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
-    expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/providers`);
+    expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/providers`, { signal: expect.any(AbortSignal) });
   });
 });
 
@@ -363,5 +364,231 @@ describe('conversation session across a mounted Chatbot', () => {
     expect(randomUUID).toHaveBeenCalledTimes(2);
     expect(sentBodies().at(-1).session).toBe(SESSION_2);
     expect(document.body.innerHTML).not.toContain(SESSION_2);
+  });
+});
+
+// --- request timeout ------------------------------------------------------
+//
+// Every request is aborted after 35 s. These tests use fake timers (never a
+// real 35 s wait) and a fetch stand-in that honours its AbortSignal the way
+// the real fetch does: an aborted request rejects with an AbortError.
+
+const TIMEOUT_MS = 35 * 1000;
+
+function abortError() {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+// A fetch that never responds until its signal aborts it.
+function hangingFetch() {
+  return jest.fn((url, { signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(abortError()));
+  }));
+}
+
+function trackSettled(promise) {
+  const state = { settled: false };
+  promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+  return state;
+}
+
+async function flushPromises() {
+  for (let i = 0; i < 5; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await Promise.resolve();
+  }
+}
+
+describe('request timeout', () => {
+  let client;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    client = freshClient();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    delete global.fetch;
+  });
+
+  test('callBackend is aborted after 35 s when fetch never settles, and not before', async () => {
+    global.fetch = hangingFetch();
+    const request = client.callBackend('Book Appointment', {});
+    const state = trackSettled(request);
+
+    jest.advanceTimersByTime(TIMEOUT_MS - 1);
+    await flushPromises();
+    expect(state.settled).toBe(false);
+
+    jest.advanceTimersByTime(1);
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    const { signal } = global.fetch.mock.calls[0][1];
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(true);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('a response whose body never arrives is also aborted after 35 s', async () => {
+    global.fetch = jest.fn((url, { signal }) => Promise.resolve({
+      ok: true,
+      json: () => new Promise((resolve, reject) => {
+        if (signal.aborted) reject(abortError()); // as the real fetch does for an already-aborted signal
+        signal.addEventListener('abort', () => reject(abortError()));
+      }),
+    }));
+    const request = client.callBackend('Book Appointment', {});
+    const state = trackSettled(request);
+    await flushPromises(); // headers have arrived; the body read is now stalled
+
+    jest.advanceTimersByTime(TIMEOUT_MS - 1);
+    await flushPromises();
+    expect(state.settled).toBe(false);
+
+    jest.advanceTimersByTime(1);
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('the timer is cleared after a successful request', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ json: () => Promise.resolve({ fulfillmentText: 'ok' }) });
+
+    const envelope = await client.callBackend('Book Appointment', {});
+
+    expect(envelope.messages[0].content.text).toBe('ok');
+    expect(jest.getTimerCount()).toBe(0);
+    expect(global.fetch.mock.calls[0][1].signal.aborted).toBe(false);
+  });
+
+  test('the timer is cleared after a rejected request, and the original error propagates', async () => {
+    global.fetch = jest.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+
+    await expect(client.callBackend('Book Appointment', {})).rejects.toThrow('Failed to fetch');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('the timer is cleared after a non-OK response, which still throws the existing error', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 500, json: jest.fn() });
+
+    await expect(client.getAppointments()).rejects.toThrow('Failed to load appointments (status 500)');
+    await expect(client.getProviders()).rejects.toThrow('Failed to load providers (status 500)');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test.each([
+    ['getAppointments', '/webhook/appointments'],
+    ['getProviders', '/webhook/providers'],
+  ])('%s is aborted after 35 s the same way', async (fn, path) => {
+    global.fetch = hangingFetch();
+    const request = client[fn]();
+
+    jest.advanceTimersByTime(TIMEOUT_MS);
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    expect(global.fetch).toHaveBeenCalledWith(`http://127.0.0.1:5000${path}`, { signal: expect.any(AbortSignal) });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('the session payload is unchanged by the timeout', async () => {
+    installCrypto({ randomUUID: jest.fn(() => SESSION_1) });
+    client = freshClient();
+    client.startConversation();
+    global.fetch = jest.fn().mockResolvedValue({ json: () => Promise.resolve({ fulfillmentText: 'ok' }) });
+
+    await client.callBackend('Book Appointment', { name: 'Sagar' });
+
+    const [url, options] = global.fetch.mock.calls[0];
+    expect(url).toBe('http://127.0.0.1:5000/webhook/webhook');
+    expect(options).toEqual({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session: SESSION_1,
+        queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
+      }),
+      signal: expect.any(AbortSignal),
+    });
+    removeCrypto();
+  });
+});
+
+// A timeout at the booking confirmation goes through the hook's existing
+// error handling and does not clear the local booking: afterwards the
+// booking is still at CONFIRM, as shown by an interruption sending NoIntent
+// first (which only happens at CONFIRM).
+describe('request timeout during a booking confirmation (rendered Chatbot)', () => {
+  function envelope(text, context = {}) {
+    return {
+      success: true,
+      error: null,
+      messages: [{ type: 'text', content: { text }, suggestions: [] }],
+      context: { intent: 'x', ...context },
+      meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+    };
+  }
+
+  function reply(body) {
+    return Promise.resolve({ json: () => Promise.resolve(body) });
+  }
+
+  async function say(value) {
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form'));
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+  }
+
+  function intents() {
+    return sentBodies().map((body) => body.queryResult.intent.displayName);
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+    delete global.fetch;
+  });
+
+  test('a timed-out "yes" shows the existing error, re-enables input and keeps the booking at CONFIRM', async () => {
+    global.fetch = jest.fn()
+      .mockReturnValueOnce(reply(envelope('May I have your name?', { bookingStage: 'name' })))
+      .mockReturnValueOnce(reply(envelope('Which provider?', { bookingStage: 'provider' })))
+      .mockReturnValueOnce(reply(envelope('What date?', { bookingStage: 'date' })))
+      .mockReturnValueOnce(reply(envelope('Available times', { bookingStage: 'slot' })))
+      .mockReturnValueOnce(reply(envelope('Please confirm (yes or no)', { bookingStage: 'confirm' })));
+    render(<Chatbot />);
+    for (const message of ['book an appointment', 'Sagar', 'dr-patel', '2026-12-28', '10:00']) {
+      await say(message);
+    }
+
+    // "yes" hangs until the 35 s timeout aborts it.
+    jest.useFakeTimers();
+    global.fetch.mockImplementationOnce((url, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(abortError()));
+    }));
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const input = screen.getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'yes' } });
+    fireEvent.submit(input.closest('form'));
+    await act(async () => {
+      await flushPromises();
+    });
+    expect(input).toBeDisabled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(TIMEOUT_MS);
+      await flushPromises();
+    });
+    errorSpy.mockRestore();
+    jest.useRealTimers();
+
+    expect(intents().at(-1)).toBe('YesIntent');
+    expect(input).not.toBeDisabled();
+    expect(screen.getByText('Sorry, an error occurred.', { selector: '[aria-label="Assistant said"]' })).toBeInTheDocument();
+
+    // The booking was not cleared: interrupting now still discards the
+    // backend pending booking first, which only happens at CONFIRM.
+    global.fetch
+      .mockReturnValueOnce(reply(envelope('discarded')))
+      .mockReturnValueOnce(reply(envelope('Here are your appointments.')));
+    await say('view my appointments');
+    expect(intents().slice(-2)).toEqual(['NoIntent', 'View Appointments']);
   });
 });
