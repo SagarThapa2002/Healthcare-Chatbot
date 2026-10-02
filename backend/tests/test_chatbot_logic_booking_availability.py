@@ -37,6 +37,11 @@ from app import app
 from backend import availability_service, chatbot_logic, provider_repository
 from backend.chatbot_logic import _format_provider_list, _format_slot_list
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 
 def make_provider(provider_id="dr-a", name="Dr. A", specialty="Test Specialty", location="Test Clinic"):
     return {"id": provider_id, "name": name, "specialty": specialty, "location": location}
@@ -256,6 +261,7 @@ class BookingFlowTestCase(unittest.TestCase):
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def post_webhook(self, intent, parameters=None):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
@@ -1011,26 +1017,31 @@ class AppointmentIdTest(BookingFlowTestCase):
             pending = json.load(f)
         self.assertNotIn("id", pending)
 
-    def test_legacy_appointment_without_an_id_is_still_listed_correctly(self):
-        # Simulates a pre-existing legacy record (no id, no providerId) -
-        # never migrated or backfilled - alongside a newly created one.
+    def test_legacy_appointment_without_an_owner_is_not_listed(self):
+        # A pre-existing legacy record (no id, no providerId, no ownerId) -
+        # never migrated or backfilled - belongs to no owner, so it is not
+        # shown to anyone.
         with open(self.appointments_file, 'w') as f:
             json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
 
         response = self.post_webhook("View Appointments")
         text = response.get_json()["messages"][0]["content"]["text"]
-        self.assertIn("Legacy Patient", text)
+        self.assertEqual(text, "You don't have any appointments booked at the moment.")
 
-    def test_legacy_appointment_without_an_id_can_still_be_cancelled_by_name(self):
+    def test_legacy_appointment_without_an_owner_cannot_be_cancelled_by_name(self):
+        legacy = {"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}
         with open(self.appointments_file, 'w') as f:
-            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+            json.dump([legacy], f)
 
-        identify = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"})
-        self.assertIn("yes or no", identify.get_json()["messages"][0]["content"]["text"])
-
-        confirmed = self.post_webhook("YesIntent")
-        text = confirmed.get_json()["messages"][0]["content"]["text"]
-        self.assertIn("has been cancelled", text)
+        identify = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"}).get_json()
+        self.assertNotIn("cancellationStage", identify["context"])
+        self.assertEqual(
+            identify["messages"][0]["content"]["text"],
+            "I couldn't find an appointment for Legacy Patient to cancel.",
+        )
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+        with open(self.appointments_file) as f:
+            self.assertEqual(json.load(f), [legacy])
 
 
 class CancellationFlowTest(BookingFlowTestCase):
@@ -1120,20 +1131,23 @@ class CancellationFlowTest(BookingFlowTestCase):
         self.assertEqual(saved[0]["status"], "cancelled")
         self.assertEqual(saved[0]["id"], appointment["id"])
 
-    def test_legacy_no_id_appointment_cancellable_by_unique_name_and_not_backfilled(self):
+    def test_hand_written_legacy_pending_cancellation_cannot_cancel_a_legacy_record(self):
+        # A legacy record can no longer be selected, so a pending cancellation
+        # for one (name/date/time) can only be hand-written. The confirmation
+        # re-checks ownership: nothing is cancelled, nothing is backfilled,
+        # and the pending cancellation is discarded.
+        legacy = {"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}
         with open(self.appointments_file, 'w') as f:
-            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
-
-        identify = self.post_webhook("Cancel Appointment", {"name": "Legacy Patient"}).get_json()
-        self.assertIn("yes or no", identify["messages"][0]["content"]["text"])
+            json.dump([legacy], f)
+        with open(self.pending_cancellation_file, 'w') as f:
+            json.dump({"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}, f)
 
         confirmed = self.post_webhook("YesIntent").get_json()
-        self.assertIn("has been cancelled", confirmed["messages"][0]["content"]["text"])
 
-        saved = self._read_appointments()
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["status"], "cancelled")
-        self.assertNotIn("id", saved[0])
+        self.assertNotIn("cancellationStage", confirmed["context"])
+        self.assertIn("no longer available to cancel", confirmed["messages"][0]["content"]["text"])
+        self.assertEqual(self._read_appointments(), [legacy])
+        self.assertFalse(os.path.exists(self.pending_cancellation_file))
 
     def test_duplicate_name_produces_disambiguation_and_cancels_neither(self):
         first = self._book_and_confirm(name="Dup Patient", date="2026-12-28", time="10:00")
@@ -1175,22 +1189,27 @@ class CancellationFlowTest(BookingFlowTestCase):
             ],
         )
 
-    def test_duplicate_name_with_one_legacy_record_does_not_offer_id_disambiguation(self):
-        self._book_and_confirm(name="Mixed Patient", date="2026-12-28", time="10:00")
+    def test_same_named_legacy_record_is_not_a_candidate_and_is_never_cancelled(self):
+        # Only the owner's own records are candidates: a same-named legacy
+        # record (no ownerId) is not part of the group, so the name resolves
+        # to the owned appointment alone and the legacy one is untouched.
+        owned = self._book_and_confirm(name="Mixed Patient", date="2026-12-28", time="10:00")
+        legacy = {"name": "Mixed Patient", "date": "2026-01-01", "time": "09:00"}
         saved = self._read_appointments()
-        saved.append({"name": "Mixed Patient", "date": "2026-01-01", "time": "09:00"})
+        saved.append(legacy)
         with open(self.appointments_file, 'w') as f:
             json.dump(saved, f)
 
         response = self.post_webhook("Cancel Appointment", {"name": "Mixed Patient"}).get_json()
-        text = response["messages"][0]["content"]["text"]
-        self.assertIn("can't safely tell them apart", text)
-        self.assertEqual(response["messages"][0]["suggestions"], [])
-        self.assertFalse(os.path.exists(self.pending_cancellation_file))
+        self.assertEqual(response["context"]["cancellationStage"], "confirm")
+        self.assertNotIn("2026-01-01", response["messages"][0]["content"]["text"])
+        with open(self.pending_cancellation_file) as f:
+            self.assertEqual(json.load(f), {"id": owned["id"]})
 
+        self.post_webhook("YesIntent")
         saved_after = self._read_appointments()
-        for a in saved_after:
-            self.assertNotIn("status", a)
+        self.assertEqual(saved_after[0]["status"], "cancelled")
+        self.assertEqual(saved_after[1], legacy)
 
     def test_cancelled_appointments_excluded_from_active_view(self):
         appointment = self._book_and_confirm()
@@ -1201,13 +1220,14 @@ class CancellationFlowTest(BookingFlowTestCase):
         text = response["messages"][0]["content"]["text"]
         self.assertIn("don't have any appointments", text.lower())
 
-    def test_legacy_no_status_appointment_remains_visible(self):
+    def test_owned_appointment_without_a_status_field_counts_as_active(self):
         with open(self.appointments_file, 'w') as f:
-            json.dump([{"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"}], f)
+            json.dump([{"id": "no-status-id", "name": "No Status Patient", "date": "2026-01-01",
+                        "time": "09:00", "ownerId": TEST_OWNER}], f)
 
         response = self.post_webhook("View Appointments").get_json()
         text = response["messages"][0]["content"]["text"]
-        self.assertIn("Legacy Patient", text)
+        self.assertIn("No Status Patient on 2026-01-01 at 09:00 (ID: no-status-id)", text)
 
     def test_active_appointment_displays_its_id(self):
         appointment = self._book_and_confirm()
@@ -1217,9 +1237,9 @@ class CancellationFlowTest(BookingFlowTestCase):
         self.assertIn(appointment["id"], text)
 
     def test_listing_uses_neutral_wording_and_keeps_its_line_format(self):
-        # Appointments are not owned by a visitor, so the heading must not
-        # say "your". The lines themselves are unchanged: name, date, time,
-        # and the ID when the record has one (legacy records have none).
+        # The heading stays neutral (no "your"). The lines are unchanged:
+        # name, date, time and ID. The legacy record appended below has no
+        # owner, so it is not listed.
         first = self._book_and_confirm(name="First Patient", date="2026-12-28", time="10:00")
         records = self._read_appointments()
         records.append({"name": "Legacy Patient", "date": "2026-01-01", "time": "09:00"})
@@ -1237,8 +1257,7 @@ class CancellationFlowTest(BookingFlowTestCase):
         self.assertEqual(
             message["content"]["text"],
             "Here are the scheduled appointments:\n"
-            f"First Patient on 2026-12-28 at 10:00 (ID: {first['id']})\n"
-            "Legacy Patient on 2026-01-01 at 09:00",
+            f"First Patient on 2026-12-28 at 10:00 (ID: {first['id']})",
         )
         self.assertNotIn("your", message["content"]["text"].lower())
 
@@ -1864,7 +1883,10 @@ class BookingSuccessProviderDetailsTest(BookingFlowTestCase):
         appointment = booked["messages"][0]["content"]["appointment"]
         self.assertEqual(set(appointment), {"id", "name", "providerId", "date", "time"})
         self.assertEqual(appointment["providerId"], "dr-patel")
-        self.assertEqual(appointment, self._saved()[0])
+        # The stored record also carries the internal ownerId, which is never returned.
+        saved = self._saved()[0]
+        self.assertEqual(saved.pop("ownerId"), TEST_OWNER)
+        self.assertEqual(appointment, saved)
 
     def test_success_message_has_no_suggestions(self):
         booked = self._book()

@@ -70,9 +70,13 @@ _current_session = contextvars.ContextVar("pending_state_session", default=None)
 # strict UUID rule as the session and held for the duration of one request.
 # Unlike the per-page-load session, the frontend keeps it in localStorage,
 # so it identifies the same browser across reloads. A successful booking
-# stores it on the new appointment as `ownerId`. It is plumbing for an
-# ownership boundary that is NOT enforced yet: no listing, lookup, update or
-# cancellation is filtered by it. It is never logged and never returned in a
+# stores it on the new appointment as `ownerId`, and every user-facing
+# appointment path - listing, viewing, cancel and update lookups and their
+# confirmations - only ever sees appointments owned by it (see _is_owned).
+# A record without `ownerId` (created before owner tokens) is reachable by
+# nobody. Availability is deliberately NOT owner-scoped: every appointment
+# still occupies its slot. This separates browsers; it is not
+# authentication. The token is never logged and never returned in a
 # response (see public_appointment).
 _current_owner = contextvars.ContextVar("appointment_owner", default=None)
 
@@ -254,6 +258,32 @@ def public_appointment(appointment):
     if not isinstance(appointment, dict):
         return appointment
     return {key: value for key, value in appointment.items() if key != "ownerId"}
+
+
+def parse_owner_token(raw):
+    """The validated owner token for a request that does not go through
+    handle_webhook_request (the GET endpoints): the same strict UUID rule as
+    the session, None for a missing or malformed value.
+    """
+    return _parse_session(raw)
+
+
+def _is_owned(appointment, owner):
+    """True only for a record owned by `owner`, a validated owner token.
+    Never true without a valid token, and never true for a record without
+    an `ownerId` (a legacy record), so neither can grant access.
+    """
+    return owner is not None and isinstance(appointment, dict) and appointment.get("ownerId") == owner
+
+
+def owned_appointments(owner):
+    """The appointment records owned by `owner` (any status), for the GET
+    endpoints - [] without a valid owner token.
+    """
+    appointments = list_appointments()
+    if not isinstance(appointments, list):
+        return []
+    return [a for a in appointments if _is_owned(a, owner)]
 
 
 def _dispatch_webhook_request(payload, request_id=None):
@@ -1137,15 +1167,17 @@ def _handle_update_appointment(parameters):
         text = "Sure - what's the ID or name on the appointment you'd like to update?"
         return [response_model.text_message(text)], _UPDATE_STAGE_IDENTIFIER
 
-    if not os.path.exists(APPOINTMENTS_FILE):
-        return [response_model.text_message("There are no appointments to update yet.")], None
-
-    appointments = _read_appointments_raw()
+    # Only this owner's appointments can be selected; anything else (another
+    # owner's, a legacy record, an unknown ID - or no data file at all) gets
+    # the same "couldn't find" reply, so nothing reveals that it exists.
+    # `appointments` stays the full list for the availability check below.
+    appointments = _read_appointments_raw() if os.path.exists(APPOINTMENTS_FILE) else []
+    owner = _current_owner.get()
 
     if appointment_id:
         selected = None
         for appointment in appointments:
-            if appointment.get('id') == appointment_id:
+            if appointment.get('id') == appointment_id and _is_owned(appointment, owner):
                 selected = appointment
                 break
         if selected is None or not _is_active(selected):
@@ -1154,7 +1186,7 @@ def _handle_update_appointment(parameters):
     else:
         candidates = [
             a for a in appointments
-            if _is_active(a) and a.get('name', '').lower() == name.lower()
+            if _is_active(a) and _is_owned(a, owner) and a.get('name', '').lower() == name.lower()
         ]
         if not candidates:
             text = f"I couldn't find an appointment for {name} to update."
@@ -1256,7 +1288,10 @@ def _handle_update_confirm_yes():
             target = appointment
             break
 
-    if target is None or not _is_active(target):
+    # Ownership is re-checked here, where the record is actually changed:
+    # the pending update only names the appointment, and this request's owner
+    # token may differ from the one that selected it.
+    if target is None or not _is_active(target) or not _is_owned(target, _current_owner.get()):
         os.remove(_pending_update_file())
         text = (
             "That appointment is no longer available to update - it may have already been "
@@ -1434,15 +1469,15 @@ def _handle_cancel_appointment(parameters):
         text = "Sure - what's the ID or name on the appointment you'd like to cancel?"
         return [response_model.text_message(text)], _CANCELLATION_STAGE_IDENTIFIER
 
-    if not os.path.exists(APPOINTMENTS_FILE):
-        return [response_model.text_message("There are no appointments to cancel yet.")], None
-
-    appointments = _read_appointments_raw()
+    # Only this owner's appointments can be selected; anything else gets the
+    # same "couldn't find" reply (see _handle_update_appointment).
+    appointments = _read_appointments_raw() if os.path.exists(APPOINTMENTS_FILE) else []
+    owner = _current_owner.get()
 
     if appointment_id:
         selected = None
         for appointment in appointments:
-            if appointment.get('id') == appointment_id:
+            if appointment.get('id') == appointment_id and _is_owned(appointment, owner):
                 selected = appointment
                 break
         if selected is None or not _is_active(selected):
@@ -1452,7 +1487,7 @@ def _handle_cancel_appointment(parameters):
     else:
         candidates = [
             a for a in appointments
-            if _is_active(a) and a.get('name', '').lower() == name.lower()
+            if _is_active(a) and _is_owned(a, owner) and a.get('name', '').lower() == name.lower()
         ]
         if not candidates:
             text = f"I couldn't find an appointment for {name} to cancel."
@@ -1522,7 +1557,9 @@ def _handle_cancel_confirm_yes():
             target = appointment
             break
 
-    if target is None or not _is_active(target):
+    # Ownership is re-checked here, where the record is actually changed (see
+    # _handle_update_confirm_yes).
+    if target is None or not _is_active(target) or not _is_owned(target, _current_owner.get()):
         os.remove(_pending_cancellation_file())
         text = (
             "That appointment is no longer available to cancel - it may have already been "
@@ -1572,32 +1609,31 @@ def _handle_cancel_confirm_no():
 
 
 def _handle_view_appointments():
-    """Next Phase 6.1 slice: excludes cancelled appointments from the
-    normal active listing (a missing `status` still counts as active, for
-    legacy records) and shows each active appointment's `id` when it has
-    one - legacy no-id records still display exactly as before, just
-    without an ID suffix.
+    """Lists the current owner's active appointments (cancelled ones are
+    excluded; a missing `status` counts as active), each with its `id`.
+    Only records owned by this request's owner token are listed - another
+    owner's appointments and legacy records without an owner never appear.
+    No data file at all is answered like an empty list, so the reply never
+    reveals whether anyone else has appointments.
     """
-    if os.path.exists(APPOINTMENTS_FILE):
-        try:
-            appointments = _read_appointments_raw()
-            active = [a for a in appointments if _is_active(a)]
-            if active:
-                response_lines = []
-                for a in active:
-                    line = f"{a['name']} on {a['date']} at {a['time']}"
-                    if a.get('id'):
-                        line += f" (ID: {a['id']})"
-                    response_lines.append(line)
-                # Neutral wording: every visitor sees every active
-                # appointment (there is no ownership or authentication).
-                text = "Here are the scheduled appointments:\n" + "\n".join(response_lines)
-            else:
-                text = "You don't have any appointments booked at the moment."
-        except json.JSONDecodeError:
-            text = "I'm having trouble reading your appointment records right now."
+    owner = _current_owner.get()
+    try:
+        appointments = _read_appointments_raw() if os.path.exists(APPOINTMENTS_FILE) else []
+    except json.JSONDecodeError:
+        return [response_model.text_message("I'm having trouble reading your appointment records right now.")]
+
+    active = [a for a in appointments if _is_active(a) and _is_owned(a, owner)]
+    if active:
+        response_lines = []
+        for a in active:
+            line = f"{a['name']} on {a['date']} at {a['time']}"
+            if a.get('id'):
+                line += f" (ID: {a['id']})"
+            response_lines.append(line)
+        # Neutral heading, kept from before owner scoping.
+        text = "Here are the scheduled appointments:\n" + "\n".join(response_lines)
     else:
-        text = "No appointment data found."
+        text = "You don't have any appointments booked at the moment."
 
     return [response_model.text_message(text)]
 

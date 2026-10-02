@@ -16,6 +16,11 @@ from app import app
 from backend import atomic_json, availability_service, chatbot_logic, reminder_service
 from backend.atomic_json import write_json_atomic
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 
 def legacy_write(path, data):
     """The write this helper replaced, byte for byte."""
@@ -164,6 +169,7 @@ class PersistencePathsUseAtomicWritesTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def assert_valid_formatted_json(self, path, data):
         with open(path, 'rb') as f:

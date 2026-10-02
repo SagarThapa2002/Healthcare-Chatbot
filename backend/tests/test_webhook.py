@@ -7,6 +7,11 @@ from unittest.mock import patch
 from app import app
 from backend import availability_service, chatbot_logic, provider_repository, reminder_service
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 
 class WebhookTestCase(unittest.TestCase):
     """Every test redirects chatbot_logic's appointment file paths to a
@@ -80,6 +85,7 @@ class WebhookTestCase(unittest.TestCase):
         self.addCleanup(patcher_reminders.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def post_webhook(self, intent, parameters=None):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
@@ -279,6 +285,7 @@ class UpdateCancelAppointmentMissingNameTest(unittest.TestCase):
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def post_webhook(self, intent, parameters=None):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
@@ -429,8 +436,22 @@ class GetRemindersTest(unittest.TestCase):
         patcher = patch.object(reminder_service, 'REMINDERS_FILE', self.reminders_file)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The endpoint returns only the reminders of appointments owned by the
+        # request's X-Owner-Token, so it reads appointments too - kept in this
+        # test's temp directory, never the real backend/appointments.json.
+        self.appointments_file = os.path.join(self.tmp_dir.name, 'appointments.json')
+        appointments_patcher = patch.object(chatbot_logic, 'APPOINTMENTS_FILE', self.appointments_file)
+        appointments_patcher.start()
+        self.addCleanup(appointments_patcher.stop)
+        with open(self.appointments_file, 'w') as f:
+            json.dump([
+                {"id": appointment_id, "name": "Test Patient", "providerId": "dr-patel",
+                 "date": "2026-12-28", "time": "10:00", "ownerId": TEST_OWNER}
+                for appointment_id in ("a1", "a2", "a3", "a4")
+            ], f)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def _write_reminders(self, reminders):
         with open(self.reminders_file, 'w') as f:
@@ -567,6 +588,7 @@ class GetProvidersTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def _write_providers(self, providers):
         with open(self.providers_file, 'w') as f:

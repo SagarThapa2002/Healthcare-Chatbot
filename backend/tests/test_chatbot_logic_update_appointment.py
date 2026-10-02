@@ -24,6 +24,11 @@ from unittest.mock import patch
 from app import app
 from backend import availability_service, chatbot_logic
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 
 class UpdateFlowTestCase(unittest.TestCase):
     """Base class: isolates appointment/pending file I/O from the real
@@ -65,6 +70,7 @@ class UpdateFlowTestCase(unittest.TestCase):
         self.addCleanup(patcher_availability_appointments.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def post_webhook(self, intent, parameters=None):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
@@ -220,43 +226,43 @@ class UpdateByNameTest(UpdateFlowTestCase):
             self.assertEqual(appointment["date"], "2026-12-28")
             self.assertNotIn("status", appointment)
 
-    def test_legacy_unique_name_update(self):
-        self._write_appointments([
-            {"name": "Legacy Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
-        ])
+    def test_legacy_record_without_an_owner_cannot_be_updated_by_name(self):
+        # A legacy record (no id, no ownerId) belongs to no owner: a name
+        # lookup does not find it and nothing is written or changed.
+        legacy = {"name": "Legacy Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"}
+        self._write_appointments([legacy])
 
         identify = self.post_webhook(
             "Update Appointment", {"name": "Legacy Patient", "date": "2026-12-30"}
         ).get_json()
-        self.assertEqual(identify["context"]["updateStage"], "confirm")
+        self.assertNotIn("updateStage", identify["context"])
+        self.assertEqual(
+            identify["messages"][0]["content"]["text"],
+            "I couldn't find an appointment for Legacy Patient to update.",
+        )
+        self.assertFalse(os.path.exists(self.pending_update_file))
+        self.assertEqual(self._read_appointments(), [legacy])
 
-        confirmed = self.post_webhook("YesIntent").get_json()
-        self.assertIn("has been updated", confirmed["messages"][0]["content"]["text"])
-
-        saved = self._read_appointments()
-        self.assertEqual(len(saved), 1)
-        self.assertNotIn("id", saved[0])
-        self.assertEqual(saved[0]["date"], "2026-12-30")
-        self.assertEqual(saved[0]["name"], "Legacy Patient")
-
-    def test_ambiguous_group_containing_legacy_record_fails_safely(self):
-        self._write_appointments([
-            {"name": "Legacy Dup", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"},
-            {"name": "Legacy Dup", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:30", "id": "real-id-1"},
-        ])
+    def test_same_named_legacy_record_is_not_a_candidate_and_is_never_changed(self):
+        # Only the owner's own record can be selected: a same-named legacy
+        # record (no ownerId) is not part of the candidate group, so the
+        # name resolves to the owned record alone and the legacy one is
+        # left untouched.
+        legacy = {"name": "Legacy Dup", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:00"}
+        owned = {"name": "Legacy Dup", "providerId": "dr-patel", "date": "2026-12-28", "time": "09:30",
+                 "id": "real-id-1", "ownerId": TEST_OWNER}
+        self._write_appointments([legacy, owned])
 
         response = self.post_webhook(
             "Update Appointment", {"name": "Legacy Dup", "date": "2026-12-30"}
         ).get_json()
-        text = response["messages"][0]["content"]["text"].lower()
-        self.assertIn("doesn't have a reference id", text)
-        self.assertIn("none have been changed", text)
-        self.assertEqual(response["context"]["updateStage"], "identifier")
-        self.assertFalse(os.path.exists(self.pending_update_file))
+        self.assertEqual(response["context"]["updateStage"], "confirm")
+        self.assertNotIn("09:00", response["messages"][0]["content"]["text"])
 
+        self.post_webhook("YesIntent")
         saved = self._read_appointments()
-        for appointment in saved:
-            self.assertEqual(appointment["date"], "2026-12-28")
+        self.assertEqual(saved[0], legacy)
+        self.assertEqual((saved[1]["date"], saved[1]["time"]), ("2026-12-30", "09:30"))
 
 
 class UpdateAvailabilityValidationTest(UpdateFlowTestCase):
@@ -305,9 +311,10 @@ class UpdateAvailabilityValidationTest(UpdateFlowTestCase):
         self.assertEqual(response["context"]["updateStage"], "confirm")
         self.assertIn("yes or no", response["messages"][0]["content"]["text"])
 
-    def test_legacy_record_with_no_provider_id_skips_availability_check(self):
+    def test_record_with_no_provider_id_skips_availability_check(self):
         self._write_appointments([
-            {"name": "No Provider", "date": "2026-12-28", "time": "10:00"},
+            {"id": "no-provider-id", "name": "No Provider", "date": "2026-12-28", "time": "10:00",
+             "ownerId": TEST_OWNER},
         ])
 
         response = self.post_webhook(
@@ -453,28 +460,23 @@ class UpdateFinalConfirmationSafetyTest(UpdateFlowTestCase):
         self.assertEqual(first_after["date"], "2026-12-28")
         self.assertEqual(second_after["date"], "2026-12-30")
 
-    def test_legacy_final_confirmation_matches_original_triple_not_first_matching_name(self):
-        self._write_appointments([
-            {"name": "Legacy Solo", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
-        ])
-        self.post_webhook("Update Appointment", {"name": "Legacy Solo", "date": "2026-12-30"})
+    def test_hand_written_legacy_pending_update_cannot_change_a_legacy_record(self):
+        # A legacy record can no longer be selected, so a pending update for
+        # one (name/originalDate/originalTime) can only be hand-written. The
+        # confirmation still re-checks ownership: nothing changes and the
+        # pending update is discarded.
+        legacy = {"name": "Legacy Solo", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"}
+        self._write_appointments([legacy])
+        with open(self.pending_update_file, 'w') as f:
+            json.dump({"name": "Legacy Solo", "originalDate": "2026-12-28", "originalTime": "10:00",
+                       "newDate": "2026-12-30"}, f)
 
-        # A second, same-named legacy record appears between selection and
-        # confirmation - the pending record's captured (name, originalDate,
-        # originalTime) triple must still identify only the original one.
-        appointments = self._read_appointments()
-        appointments.append(
-            {"name": "Legacy Solo", "providerId": "dr-patel", "date": "2026-12-28", "time": "11:00"}
-        )
-        self._write_appointments(appointments)
+        response = self.post_webhook("YesIntent").get_json()
 
-        self.post_webhook("YesIntent")
-
-        saved = self._read_appointments()
-        original = next(a for a in saved if a["time"] == "10:00" or a["date"] == "2026-12-30")
-        untouched = next(a for a in saved if a["time"] == "11:00")
-        self.assertEqual(original["date"], "2026-12-30")
-        self.assertEqual(untouched["date"], "2026-12-28")
+        self.assertNotIn("updateStage", response["context"])
+        self.assertIn("no longer available to update", response["messages"][0]["content"]["text"])
+        self.assertEqual(self._read_appointments(), [legacy])
+        self.assertFalse(os.path.exists(self.pending_update_file))
 
 
 class UpdatePendingTransactionMutualExclusionTest(UpdateFlowTestCase):

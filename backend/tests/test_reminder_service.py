@@ -19,6 +19,11 @@ from unittest.mock import Mock, patch
 from app import app
 from backend import availability_service, chatbot_logic, reminder_config, reminder_service
 
+# Every webhook request in this file is sent with this browser owner token, so
+# the appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 
 def make_appointment(**overrides):
     appointment = {
@@ -657,6 +662,7 @@ class ReminderIntegrationTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def post_webhook(self, intent, parameters=None):
         body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}

@@ -25,7 +25,7 @@ This project demonstrates a healthcare chatbot that:
 - Performs intent detection in the frontend via keyword/pattern matching (`frontend/src/conversation/intent.js`); the backend webhook contract mirrors the Dialogflow ES fulfillment format, but Dialogflow is not currently wired in at runtime (see `dialogflow/README.md`)
 - Has a Flask backend that owns all validation, availability and persistence
 - Stores appointments and reminders in local JSON files (there is no database: `backend/db.py`, `backend/models.py` and `database/init_db.sql` are empty placeholders)
-- Exposes read-only API endpoints that list all stored appointments, providers and reminders
+- Exposes read-only API endpoints that list the calling browser's appointments and reminders, and all providers
 - Includes a deterministic, rule-based symptom-triage module (`backend/symptom_triage.py`) that is fully implemented and tested but not yet connected to the live chatbot, and whose production rule file currently contains zero active (clinically reviewed) rules - see `backend/SYMPTOM_RULES_SOURCES.md`
 
 ---
@@ -39,19 +39,19 @@ This project demonstrates a healthcare chatbot that:
   A guided chat flow: name → provider → date → time slot → confirmation (see [Booking flow](#-booking-flow)). It can start from one sentence, e.g. `Book an appointment for John on 26 December 2026 at 10am`; the provider is always asked for separately. Provider chips and time-slot chips can be clicked instead of typed.
 
 - **View, Update and Cancel Appointments**
-  `view my appointments` lists active appointments in chat. `update my appointment` and `cancel my appointment` ask for an appointment ID (or a name, which works when it matches exactly one appointment), then ask for a yes/no confirmation. An update can change only the date and/or time, and is checked against the provider's availability.
+  `view my appointments` lists this browser's active appointments in chat. `update my appointment` and `cancel my appointment` ask for an appointment ID (or a name, which works when it matches exactly one of this browser's appointments), then ask for a yes/no confirmation. An update can change only the date and/or time, and is checked against the provider's availability. All three only reach appointments booked from the same browser - see [Data and safety notice](#data-and-safety-notice).
 
 - **Appointment Storage**
   Appointments are stored in `backend/appointments.json`. New bookings get a stable `id`; cancelled appointments are kept with `status: "cancelled"` rather than deleted.
 
 - **API to View Appointments**
-  `GET /webhook/appointments` returns every stored appointment record. There is no per-user filtering.
+  `GET /webhook/appointments` returns the active appointments booked from the calling browser (identified by its `X-Owner-Token` header), and nothing without a valid token.
 
 - **Chat Webhook**
   Chat messages are sent as `POST /webhook/webhook` - the blueprint's `/webhook` prefix combined with the route's own `/webhook` path.
 
 - **Appointments View**
-  A read-only Appointments tab in the frontend lists the active (not cancelled) appointments stored on the server - **every visitor's, not only your own** - with name, date, time, and provider when known. Booking, updating, and cancelling an appointment still happens through chat.
+  A read-only Appointments tab in the frontend lists the active (not cancelled) appointments booked from this browser, with name, date, time, and provider when known. Booking, updating, and cancelling an appointment still happens through chat.
 
 - **General Health Questions**
   An optional, disabled-by-default LLM-backed assistant can answer general health questions that don't match any other intent, controlled by the `LLM_ENABLED` environment variable. See `backend/LLM_ASSISTANT_NOTES.md` for details.
@@ -257,8 +257,9 @@ Set these through your host's environment-variable settings - `.env` files are n
 - **Restarts:** data survives a process restart only if the host preserves the disk. Hosts that replace or reset the filesystem on restart or redeploy lose all stored data.
 - **Redeploys:** `backend/appointments.json` and `backend/reminders.json` are tracked in Git, so a Git-based redeploy can reset them to the repository's version.
 - **Per-conversation state:** an in-progress booking, cancellation or update is isolated per chat session - the frontend sends a random session id with each request, so one visitor's "yes" cannot confirm another visitor's pending action. The session id only separates conversations; it is not authentication. A pending booking, cancellation or update that is still waiting for "yes" or "no" expires after 30 minutes, after which a reply no longer acts on it.
-- **No authentication:** every endpoint is public. `GET /webhook/appointments` and `GET /webhook/reminders` return all stored records to anyone, and the Appointments tab and the chat's "view my appointments" show every visitor's active appointments. An appointment can be updated or cancelled by anyone who knows its ID (or, when it is unique, the name on it).
-- **Owner token (not yet enforced):** the frontend keeps a random per-browser id in `localStorage` and sends it as the `X-Owner-Token` header; newly booked appointments store it internally as `ownerId`, and it is never returned in API responses or logged. This is groundwork for a later ownership boundary only - **nothing is filtered or restricted by it yet**, so the "No authentication" point above still applies in full. Even once enforced it will not be authentication: it is tied to one browser profile, is lost if site data is cleared, and anyone who obtains the value can use it.
+- **Appointments are scoped to a browser, not a person:** the frontend keeps a random per-browser id in `localStorage` and sends it as the `X-Owner-Token` header. Newly booked appointments store it internally as `ownerId` (never returned in API responses or logged), and listing, viewing, cancelling and updating - in chat, `GET /webhook/appointments` and `GET /webhook/reminders` - only reach appointments with the same id. Another browser's appointment is answered exactly like one that does not exist, and ownership is checked again when a cancellation or update is confirmed.
+- **No authentication:** this is not a login. The owner token is tied to one browser profile (a different browser, device or private window starts with none), it is lost if site data is cleared, and anyone who obtains the value - from that browser's storage, or by watching an unencrypted connection - can use it. A request without a valid token can still book an appointment, but that appointment is then reachable by no one. There is no rate limiting.
+- **Legacy appointments:** records created before owner tokens have no `ownerId`, so they are not listed, viewed, cancelled or updated by anyone. They are not migrated or deleted, and they still block their time slot, because availability is checked against every appointment regardless of owner.
 - **Do not enter real patient or personal information.** Use made-up names and details only.
 
 ---

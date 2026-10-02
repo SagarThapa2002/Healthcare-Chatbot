@@ -16,6 +16,11 @@ from unittest.mock import patch
 from app import app
 from backend import availability_service, chatbot_logic, reminder_service
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 SESSION_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 SESSION_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 APPOINTMENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -52,6 +57,7 @@ class ConversationIsolationTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     # --- helpers ---
 
@@ -83,7 +89,7 @@ class ConversationIsolationTest(unittest.TestCase):
     def seed_appointment(self):
         with open(self.appointments_file, 'w') as f:
             json.dump([{"id": APPOINTMENT_ID, "name": "Sagar", "providerId": "dr-patel",
-                        "date": "2026-12-28", "time": "10:00"}], f)
+                        "date": "2026-12-28", "time": "10:00", "ownerId": TEST_OWNER}], f)
 
     # --- bookings ---
 

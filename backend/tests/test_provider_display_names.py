@@ -15,14 +15,22 @@ from unittest.mock import patch
 from app import app
 from backend import availability_service, chatbot_logic, provider_repository, reminder_service
 
+# Every request in this file is sent with this browser owner token, so the
+# appointments these tests book are owned by - and visible to - that owner
+# (appointment access is owner-scoped; see backend/tests/test_owner_token.py).
+TEST_OWNER = "7e570000-0000-4000-8000-000000000001"
+
 ID_A = "11111111-1111-4111-8111-111111111111"
 ID_B = "22222222-2222-4222-8222-222222222222"
 
 
 def appointment(appointment_id, provider_id="dr-patel", time="10:00", name="Test Patient"):
+    # A record with an id is a current-format record booked by TEST_OWNER; one
+    # without (legacy) has no owner either, so no one can reach it.
     record = {"name": name, "date": "2026-12-28", "time": time}
     if appointment_id:
         record["id"] = appointment_id
+        record["ownerId"] = TEST_OWNER
     if provider_id:
         record["providerId"] = provider_id
     return record
@@ -53,6 +61,7 @@ class ProviderDisplayNameTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = app.test_client()
+        self.client.environ_base['HTTP_X_OWNER_TOKEN'] = TEST_OWNER
 
     def seed(self, *records):
         with open(self.files['appointments'], 'w') as f:
@@ -176,14 +185,15 @@ class ProviderDisplayNameTest(unittest.TestCase):
             "Please confirm — cancel the appointment for Test Patient on 2026-12-28 at 10:00? (yes or no)",
         )
 
-    def test_legacy_list_without_ids_or_provider_keeps_its_current_wording(self):
+    def test_legacy_records_without_an_owner_are_not_listed_for_cancellation(self):
+        # Legacy records (no id, no ownerId) belong to no owner, so a name
+        # lookup does not find them - and nothing about them is shown.
         self.seed(appointment(None, provider_id=None, time="10:00"),
                   appointment(None, provider_id=None, time="11:00"))
         response = self.post("Cancel Appointment", {"name": "Test Patient"})
-        text = self.text(response)
-        self.assertIn("can't safely tell them apart", text)
-        self.assertIn("- 2026-12-28 at 10:00\n- 2026-12-28 at 11:00", text)
-        self.assertNotIn("provider", text)
+        self.assertNotIn("cancellationStage", response["context"])
+        self.assertEqual(self.text(response), "I couldn't find an appointment for Test Patient to cancel.")
+        self.assertFalse(os.path.exists(self.files['pending_cancellation']))
 
 
 if __name__ == '__main__':
