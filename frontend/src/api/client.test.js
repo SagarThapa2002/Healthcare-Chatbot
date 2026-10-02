@@ -3,6 +3,8 @@ import { webcrypto } from 'crypto';
 import { getProviders, resolveApiBaseUrl } from './client';
 import Chatbot from '../components/Chatbot';
 
+const OWNER_HEADER = { 'X-Owner-Token': expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/) };
+
 // fetch is mocked entirely - these tests never touch the network and
 // don't need a real backend running.
 describe('getProviders', () => {
@@ -97,11 +99,14 @@ describe.each([
 
   beforeEach(() => {
     global.fetch = jest.fn();
+    window.localStorage.clear();
+    installCrypto({ randomUUID: () => webcrypto.randomUUID() });
     client = loadClientWith(configured);
   });
 
   afterEach(() => {
     delete global.fetch;
+    removeCrypto();
   });
 
   test('callBackend POSTs the unchanged payload to /webhook/webhook', async () => {
@@ -112,7 +117,7 @@ describe.each([
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/webhook`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...OWNER_HEADER },
       body: JSON.stringify({
         queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
       }),
@@ -126,7 +131,9 @@ describe.each([
     await client.getAppointments();
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
-    expect(global.fetch).toHaveBeenCalledWith(`${expectedBase}/webhook/appointments`, { signal: expect.any(AbortSignal) });
+    expect(global.fetch).toHaveBeenCalledWith(
+      `${expectedBase}/webhook/appointments`, { headers: OWNER_HEADER, signal: expect.any(AbortSignal) }
+    );
   });
 
   test('getProviders requests /webhook/providers', async () => {
@@ -404,12 +411,15 @@ describe('request timeout', () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
+    window.localStorage.clear();
+    installCrypto({ randomUUID: () => webcrypto.randomUUID() });
     client = freshClient();
   });
 
   afterEach(() => {
     jest.useRealTimers();
     delete global.fetch;
+    removeCrypto();
   });
 
   test('callBackend is aborted after 35 s when fetch never settles, and not before', async () => {
@@ -476,15 +486,15 @@ describe('request timeout', () => {
   });
 
   test.each([
-    ['getAppointments', '/webhook/appointments'],
-    ['getProviders', '/webhook/providers'],
-  ])('%s is aborted after 35 s the same way', async (fn, path) => {
+    ['getAppointments', '/webhook/appointments', { headers: OWNER_HEADER }],
+    ['getProviders', '/webhook/providers', {}],
+  ])('%s is aborted after 35 s the same way', async (fn, path, options) => {
     global.fetch = hangingFetch();
     const request = client[fn]();
 
     jest.advanceTimersByTime(TIMEOUT_MS);
     await expect(request).rejects.toMatchObject({ name: 'AbortError' });
-    expect(global.fetch).toHaveBeenCalledWith(`http://127.0.0.1:5000${path}`, { signal: expect.any(AbortSignal) });
+    expect(global.fetch).toHaveBeenCalledWith(`http://127.0.0.1:5000${path}`, { ...options, signal: expect.any(AbortSignal) });
     expect(jest.getTimerCount()).toBe(0);
   });
 
@@ -500,7 +510,7 @@ describe('request timeout', () => {
     expect(url).toBe('http://127.0.0.1:5000/webhook/webhook');
     expect(options).toEqual({
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...OWNER_HEADER },
       body: JSON.stringify({
         session: SESSION_1,
         queryResult: { intent: { displayName: 'Book Appointment' }, parameters: { name: 'Sagar' } },
@@ -591,5 +601,124 @@ describe('request timeout during a booking confirmation (rendered Chatbot)', () 
       .mockReturnValueOnce(reply(envelope('Here are your appointments.')));
     await say('view my appointments');
     expect(intents().slice(-2)).toEqual(['NoIntent', 'View Appointments']);
+  });
+});
+
+// --- owner token ------------------------------------------------------------
+//
+// One random id per browser, kept in localStorage (so it survives reloads,
+// unlike the per-page-load session) and sent as the X-Owner-Token header on
+// the chat and appointment requests. Not yet enforced by the backend. A
+// "reload" is simulated by importing a fresh copy of the client module while
+// localStorage keeps its contents.
+describe('owner token', () => {
+  const OK_REPLY = { ok: true, json: () => Promise.resolve({ fulfillmentText: 'ok' }) };
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    installCrypto({ randomUUID: () => webcrypto.randomUUID() });
+    global.fetch = jest.fn().mockResolvedValue(OK_REPLY);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    removeCrypto();
+    delete global.fetch;
+    window.localStorage.clear();
+  });
+
+  function headerOf(call) {
+    return global.fetch.mock.calls[call][1].headers?.['X-Owner-Token'];
+  }
+
+  test('is generated when absent, persisted in localStorage, and sent on the chat request', async () => {
+    const client = freshClient();
+    await client.callBackend('Book Appointment', {});
+
+    const token = headerOf(0);
+    expect(token).toMatch(V4_UUID);
+    expect(window.localStorage.getItem('ownerToken')).toBe(token);
+  });
+
+  test('is reused after a reload (a fresh client import) and on later requests', async () => {
+    const first = freshClient();
+    await first.callBackend('Book Appointment', {});
+    const second = freshClient();
+    await second.callBackend('Book Appointment', {});
+    await second.getAppointments();
+
+    expect(headerOf(1)).toBe(headerOf(0));
+    expect(headerOf(2)).toBe(headerOf(0));
+  });
+
+  test('an invalid stored value is replaced with a new valid token', async () => {
+    window.localStorage.setItem('ownerToken', 'not-a-uuid');
+    const client = freshClient();
+    await client.callBackend('Book Appointment', {});
+
+    expect(headerOf(0)).toMatch(V4_UUID);
+    expect(window.localStorage.getItem('ownerToken')).toBe(headerOf(0));
+  });
+
+  test('if localStorage throws, an in-memory token is used for this page load and requests still work', async () => {
+    jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('SecurityError'); });
+    const setItem = jest.spyOn(Storage.prototype, 'setItem');
+    const client = freshClient();
+
+    const reply = await client.callBackend('Book Appointment', {});
+    await client.getAppointments();
+
+    expect(reply.messages[0].content.text).toBe('ok');
+    expect(headerOf(0)).toMatch(V4_UUID);
+    expect(headerOf(1)).toBe(headerOf(0));
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  test('is sent on the chat and appointments requests only - not on providers', async () => {
+    global.fetch.mockResolvedValue({ ok: true, json: () => Promise.resolve([]) });
+    const client = freshClient();
+    await client.callBackend('View Appointments', {});
+    await client.getAppointments();
+    await client.getProviders();
+
+    const [chatUrl] = global.fetch.mock.calls[0];
+    const [appointmentsUrl] = global.fetch.mock.calls[1];
+    const [providersUrl, providersOptions] = global.fetch.mock.calls[2];
+    expect(chatUrl).toBe('http://127.0.0.1:5000/webhook/webhook');
+    expect(headerOf(0)).toMatch(V4_UUID);
+    expect(appointmentsUrl).toBe('http://127.0.0.1:5000/webhook/appointments');
+    expect(headerOf(1)).toBe(headerOf(0));
+    expect(providersUrl).toBe('http://127.0.0.1:5000/webhook/providers');
+    expect(providersOptions.headers).toBeUndefined();
+  });
+
+  test('never appears in a request body or URL', async () => {
+    const client = freshClient();
+    client.startConversation();
+    await client.callBackend('Book Appointment', { name: 'Sagar' });
+    await client.getAppointments();
+
+    const token = headerOf(0);
+    for (const [url, options] of global.fetch.mock.calls) {
+      expect(url).not.toContain(token);
+      expect(options.body ?? '').not.toContain(token);
+    }
+    expect(Object.keys(JSON.parse(global.fetch.mock.calls[0][1].body))).toEqual(['session', 'queryResult']);
+  });
+
+  test('the session stays per page load and separate: a reload gets a new session but the same owner token', async () => {
+    const first = freshClient();
+    first.startConversation();
+    await first.callBackend('Book Appointment', {});
+    const second = freshClient();
+    second.startConversation();
+    await second.callBackend('Book Appointment', {});
+
+    const [firstBody, secondBody] = sentBodies();
+    expect(firstBody.session).toMatch(V4_UUID);
+    expect(secondBody.session).toMatch(V4_UUID);
+    expect(secondBody.session).not.toBe(firstBody.session);
+    expect(headerOf(1)).toBe(headerOf(0));
+    expect(firstBody.session).not.toBe(headerOf(0));
   });
 });

@@ -66,6 +66,16 @@ PENDING_UPDATE_FILE = os.path.join(os.path.dirname(__file__), 'pending_update.js
 # never logged.
 _current_session = contextvars.ContextVar("pending_state_session", default=None)
 
+# The browser's owner token (X-Owner-Token header), validated with the same
+# strict UUID rule as the session and held for the duration of one request.
+# Unlike the per-page-load session, the frontend keeps it in localStorage,
+# so it identifies the same browser across reloads. A successful booking
+# stores it on the new appointment as `ownerId`. It is plumbing for an
+# ownership boundary that is NOT enforced yet: no listing, lookup, update or
+# cancellation is filtered by it. It is never logged and never returned in a
+# response (see public_appointment).
+_current_owner = contextvars.ContextVar("appointment_owner", default=None)
+
 
 def _parse_session(raw):
     """Returns the canonical lowercase UUID string for a valid session id,
@@ -220,18 +230,30 @@ def list_appointments():
         return []
 
 
-def handle_webhook_request(payload, request_id=None):
-    """Resolves this request's conversation session (see _parse_session)
-    for the duration of the request, then dispatches it. A non-dict payload
-    is passed through unchanged, so it fails exactly as it did before.
+def handle_webhook_request(payload, request_id=None, owner_token=None):
+    """Resolves this request's conversation session and owner token (both
+    via _parse_session; a missing or malformed value is None) for the
+    duration of the request, then dispatches it. A non-dict payload is passed
+    through unchanged, so it fails exactly as it did before.
     """
     session = _parse_session(payload.get("session")) if isinstance(payload, dict) else None
     token = _current_session.set(session)
+    owner_reset = _current_owner.set(_parse_session(owner_token))
     try:
         _expire_stale_pending_state()
         return _dispatch_webhook_request(payload, request_id=request_id)
     finally:
+        _current_owner.reset(owner_reset)
         _current_session.reset(token)
+
+
+def public_appointment(appointment):
+    """An appointment record as it may be returned to a client: everything
+    except the internal `ownerId`. Non-dict entries are returned unchanged.
+    """
+    if not isinstance(appointment, dict):
+        return appointment
+    return {key: value for key, value in appointment.items() if key != "ownerId"}
 
 
 def _dispatch_webhook_request(payload, request_id=None):
@@ -852,6 +874,9 @@ def _handle_yes_intent():
                 appointments = []
 
         appointment['id'] = str(uuid.uuid4())
+        owner = _current_owner.get()
+        if owner:
+            appointment['ownerId'] = owner
         appointments.append(appointment)
         _save_appointments(appointments)
         _schedule_reminder_for_booking(appointment)
@@ -862,7 +887,7 @@ def _handle_yes_intent():
             f"Your appointment{provider_phrase} for {appointment['name']} on {appointment['date']} "
             f"at {appointment['time']} has been booked."
         )
-        return [response_model.booking_confirmation_message(text, appointment)], "booked"
+        return [response_model.booking_confirmation_message(text, public_appointment(appointment))], "booked"
 
     text = "There is no appointment pending confirmation."
     return [response_model.text_message(text)], None

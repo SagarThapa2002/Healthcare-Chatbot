@@ -4,7 +4,7 @@ from flask import Blueprint, request, jsonify
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from backend import provider_repository, reminder_service, response_model
-from backend.chatbot_logic import handle_webhook_request, list_appointments
+from backend.chatbot_logic import handle_webhook_request, list_appointments, public_appointment
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,9 @@ def webhook():
         payload = request.get_json(force=True)
         logger.info("webhook request received request_id=%s", request_id)
 
-        result = handle_webhook_request(payload, request_id=request_id)
+        result = handle_webhook_request(
+            payload, request_id=request_id, owner_token=request.headers.get('X-Owner-Token')
+        )
         logger.info(
             "webhook request completed request_id=%s intent=%s success=%s",
             request_id,
@@ -51,7 +53,11 @@ def webhook():
 
 @webhook_bp.route('/appointments', methods=['GET'])
 def get_appointments():
-    return jsonify(list_appointments())
+    # ownerId is internal and never returned (see public_appointment).
+    appointments = list_appointments()
+    if isinstance(appointments, list):
+        appointments = [public_appointment(a) for a in appointments]
+    return jsonify(appointments)
 
 
 @webhook_bp.route('/reminders', methods=['GET'])

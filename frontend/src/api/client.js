@@ -53,6 +53,36 @@ function startConversation() {
   conversationSession = newSessionId();
 }
 
+// Owner token: one random id per browser, kept in localStorage so it
+// survives reloads (unlike the per-page-load session above), and sent as
+// the X-Owner-Token header on the chat and appointment requests. The
+// backend stores it on newly booked appointments. It is plumbing for an
+// ownership boundary that is NOT enforced yet, and it is not
+// authentication: anyone holding the value can present it. If localStorage
+// is unavailable (blocked, private mode), an in-memory token is used for
+// this page load instead.
+const OWNER_TOKEN_KEY = 'ownerToken';
+const OWNER_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+let memoryOwnerToken = null;
+
+function ownerToken() {
+  try {
+    const stored = window.localStorage.getItem(OWNER_TOKEN_KEY);
+    if (stored && OWNER_TOKEN_PATTERN.test(stored)) return stored;
+    const created = newSessionId();
+    if (created) window.localStorage.setItem(OWNER_TOKEN_KEY, created);
+    return created;
+  } catch (err) {
+    if (!memoryOwnerToken) memoryOwnerToken = newSessionId();
+    return memoryOwnerToken;
+  }
+}
+
+function ownerHeaders() {
+  const token = ownerToken();
+  return token ? { 'X-Owner-Token': token } : {};
+}
+
 // Longest a request may take, start to finish, before it is aborted - a
 // few seconds above the backend's own 30 s limits (LLM call, Gunicorn
 // worker), so a slow but legitimate answer is not cut off. Without it a
@@ -83,7 +113,7 @@ async function callBackend(intent, parameters) {
     `${API_BASE_URL}/webhook/webhook`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...ownerHeaders() },
       body: JSON.stringify(payload),
     },
     (response) => response.json(),
@@ -97,7 +127,7 @@ async function callBackend(intent, parameters) {
 // a non-OK response so callers can distinguish "request failed" from "no
 // appointments" (an empty array is a valid, successful response).
 async function getAppointments() {
-  return fetchWithTimeout(`${API_BASE_URL}/webhook/appointments`, {}, (response) => {
+  return fetchWithTimeout(`${API_BASE_URL}/webhook/appointments`, { headers: ownerHeaders() }, (response) => {
     if (!response.ok) {
       throw new Error(`Failed to load appointments (status ${response.status})`);
     }
