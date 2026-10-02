@@ -1,6 +1,8 @@
 # 🏥 Healthcare Chatbot for Primary Care and Appointment Scheduling
 
-A healthcare chatbot system that provides basic symptom checks and allows patients to book appointments using natural language. Intent detection currently happens directly in the React frontend; the Flask backend's webhook contract mirrors the Dialogflow ES fulfillment format but Dialogflow itself is not wired in at runtime. See `dialogflow/README.md` for a hand-authored Dialogflow ES scaffold matching that contract.
+A portfolio/demo healthcare chatbot: a React chat frontend and a Flask backend that together let a user book, view, update and cancel appointments with a small set of synthetic providers, ask general health questions, and see basic, non-clinical symptom guidance. Intent detection happens in the React frontend; the Flask backend's webhook contract mirrors the Dialogflow ES fulfillment format, but Dialogflow itself is not wired in at runtime. See `dialogflow/README.md` for a hand-authored Dialogflow ES scaffold matching that contract.
+
+It is **not** a clinical tool: it does not diagnose, has no authentication, and stores data in local JSON files (see [Data and safety notice](#data-and-safety-notice)).
 
 ---
 
@@ -17,50 +19,89 @@ A healthcare chatbot system that provides basic symptom checks and allows patien
 
 This project demonstrates a healthcare chatbot that:
 
-- Accepts symptom-related queries and provides basic advice
-- Enables patients to book an appointment with a doctor
+- Accepts symptom-related messages and replies with a fixed, generic suggestion to monitor the symptom and see a healthcare provider if it worsens (no triage or diagnosis)
+- Books appointments through a step-by-step chat flow with a choice of provider, date and time slot, checked against provider availability by the backend
+- Lets users view, update (date/time) and cancel appointments through chat
 - Performs intent detection in the frontend via keyword/pattern matching (`frontend/src/conversation/intent.js`); the backend webhook contract mirrors the Dialogflow ES fulfillment format, but Dialogflow is not currently wired in at runtime (see `dialogflow/README.md`)
-- Has a Flask-based backend for webhook logic
-- Stores booked appointments in a local JSON file
-- Exposes an API endpoint to view all booked appointments
+- Has a Flask backend that owns all validation, availability and persistence
+- Stores appointments and reminders in local JSON files (there is no database: `backend/db.py`, `backend/models.py` and `database/init_db.sql` are empty placeholders)
+- Exposes read-only API endpoints that list all stored appointments, providers and reminders
 - Includes a deterministic, rule-based symptom-triage module (`backend/symptom_triage.py`) that is fully implemented and tested but not yet connected to the live chatbot, and whose production rule file currently contains zero active (clinically reviewed) rules - see `backend/SYMPTOM_RULES_SOURCES.md`
 
 ---
 
 ## 💡 Features
 
-- **Symptom Checker**  
-  Users can say things like:  
-  `I have a headache` or `I'm feeling dizzy`.
+- **Symptom Checker**
+  Messages containing a symptom keyword (e.g. `I have a headache`, `I'm feeling dizzy`) get a fixed, generic reply suggesting the user keep an eye on the symptom and see a healthcare provider if it worsens. It does not assess urgency or diagnose; the triage module described above is not connected.
 
-- **Appointment Booking**  
-  Users can book appointments with utterances like:  
-  `I want to book an appointment for John on May 5th at 10am`.
+- **Appointment Booking**
+  A guided chat flow: name → provider → date → time slot → confirmation (see [Booking flow](#-booking-flow)). It can start from one sentence, e.g. `Book an appointment for John on 26 December 2026 at 10am`; the provider is always asked for separately. Provider chips and time-slot chips can be clicked instead of typed.
 
-- **Appointment Storage**  
-  All appointments are stored in `appointments.json`.
+- **View, Update and Cancel Appointments**
+  `view my appointments` lists active appointments in chat. `update my appointment` and `cancel my appointment` ask for an appointment ID (or a name, which works when it matches exactly one appointment), then ask for a yes/no confirmation. An update can change only the date and/or time, and is checked against the provider's availability.
 
-- **API to View Appointments**  
-  Access booked appointments via GET request to `/webhook/appointments`.
+- **Appointment Storage**
+  Appointments are stored in `backend/appointments.json`. New bookings get a stable `id`; cancelled appointments are kept with `status: "cancelled"` rather than deleted.
+
+- **API to View Appointments**
+  `GET /webhook/appointments` returns every stored appointment record. There is no per-user filtering.
 
 - **Chat Webhook**
   Chat messages are sent as `POST /webhook/webhook` - the blueprint's `/webhook` prefix combined with the route's own `/webhook` path.
 
 - **Appointments View**
-  A read-only Appointments tab in the frontend lists your active appointments (name, date, time, and provider when known). Booking, updating, and cancelling an appointment still happens through chat.
+  A read-only Appointments tab in the frontend lists the active (not cancelled) appointments stored on the server - **every visitor's, not only your own** - with name, date, time, and provider when known. Booking, updating, and cancelling an appointment still happens through chat.
 
 - **General Health Questions**
   An optional, disabled-by-default LLM-backed assistant can answer general health questions that don't match any other intent, controlled by the `LLM_ENABLED` environment variable. See `backend/LLM_ASSISTANT_NOTES.md` for details.
 
 ---
 
+## 🏗️ Architecture
+
+```
+React frontend (frontend/)                         Flask backend (app.py + backend/)
+  useConversation.js  ── POST /webhook/webhook ──▶  webhook.py → chatbot_logic.py
+  (intent detection,      {session, queryResult:      (validation, provider/availability
+   booking step state)     {intent, parameters}}       checks, persistence, reminders)
+  AppointmentsView.js ── GET /webhook/appointments, GET /webhook/providers
+```
+
+- **Frontend:** `frontend/src/conversation/intent.js` classifies each message with keyword/pattern matching and `useConversation.js` sends it, with the fields collected so far, to the backend through `frontend/src/api/client.js`. The client adds a random per-page-load `session` id and aborts any request that takes longer than 35 seconds; a failed or timed-out request shows a generic error message in the chat and re-enables the input.
+- **Backend:** every reply uses one response envelope (`success`, `error`, `messages`, `context`, `meta`), and `POST /webhook/webhook` returns HTTP 200 even for errors (see [API Contract](#-api-contract-openapi)). The backend is the authority for everything that matters: it resolves providers, computes available slots from `backend/provider_availability.json`, re-checks availability before saving, and writes all data. The frontend never computes availability.
+- **Conversation state:** `context.bookingStage`, `context.updateStage` and `context.cancellationStage` tell the frontend which step the backend is waiting on; the frontend only advances when the backend reports it. An in-progress booking, update or cancellation awaiting "yes"/"no" is stored per `session` and expires after 30 minutes.
+- **LLM boundary:** only messages that match no other intent ("General FAQ") can reach the optional LLM, and `backend/assistant_service.py` deterministically refuses appointment actions, diagnosis, medication and treatment requests before any call, then scans the model's output (see `backend/LLM_ASSISTANT_NOTES.md`). With `LLM_ENABLED` unset (the default) these messages get a fixed greeting.
+- **Logging:** metadata only (request id, intent, outcome labels, exception class names) - never message text, names, prompts, model output or exception messages (see `backend/LOGGING_NOTES.md`).
+
+---
+
+## 📅 Booking flow
+
+```
+NAME → PROVIDER → DATE → SLOT → CONFIRM → BOOKED
+```
+
+1. **Name** - asked for unless the opening message contained a capitalised name (`... for John ...`).
+2. **Provider** - chosen from the list in `backend/providers.json` (three synthetic providers), by number, id or name.
+3. **Date** - typed as `2026-12-28`, `28-12-2026` or `28 December 2026`. The backend rejects a date the provider does not work on or that is fully booked, and asks again.
+4. **Slot** - one of the currently free times for that provider and date, generated by `backend/availability_service.py`.
+5. **Confirm** - "yes" re-checks that the slot is still free and saves the appointment (with a reminder, if `CLINIC_TIMEZONE` is set); "no" discards it.
+
+If the slot was taken by someone else in the meantime, the booking returns to **SLOT** with the current times (or to **DATE** if that day is now full) instead of being saved. Mentioning a symptom, or asking to view, update or cancel appointments, part-way through abandons the in-progress booking.
+
+Limitations: dates in the past are not rejected; times are clinic-local with no timezone handling outside reminders; intent detection is simple keyword matching, so a message containing e.g. "book", "cancel" or "update" anywhere is treated as that request.
+
+---
+
 ## ⚙️ Technologies Used
 
+- **Frontend:** React 19 (Create React App / `react-scripts` 5), Tailwind CSS 3, Jest + React Testing Library - Node 24 (`frontend/.nvmrc`)
+- **Backend:** Python 3.11 (`.python-version`), Flask 3.1, Flask-Cors, Gunicorn for production serving (`backend/requirements.txt`)
+- **Optional LLM:** Anthropic Python SDK (`anthropic`), only used when `LLM_ENABLED=true`
+- **CI:** GitHub Actions (`.github/workflows/ci.yml`)
 - **Dialogflow ES** – webhook contract only (see `dialogflow/README.md`); not wired in at runtime
-- **Python 3**
-- **Flask**
 - **Ngrok** – previously used for tunneling localhost to a live Dialogflow agent; not required for the current setup
-- **Git/GitHub** – for version control
 
 ---
 
@@ -68,17 +109,16 @@ This project demonstrates a healthcare chatbot that:
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11 (the version pinned in `.python-version` and used by CI)
 - Pip
-- Node.js & npm
-- Ngrok (optional - see "Technologies Used" above)
+- Node.js 24 and npm (pinned in `frontend/.nvmrc`)
 - Git
 
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/healthcare-chatbot.git
-cd healthcare-chatbot
+git clone https://github.com/SagarThapa2002/Healthcare-Chatbot.git
+cd Healthcare-Chatbot
 ```
 
 ### Backend Setup
@@ -121,9 +161,11 @@ Ngrok is not needed for either command (see "Technologies Used").
 
 ```bash
 cd frontend
-npm install
-npm start
+npm ci        # installs the exact versions in package-lock.json, as CI does
+npm start     # development server on http://localhost:3000
 ```
+
+The backend must also be running (see Backend Setup above). The repository-root `package.json` is not used by the app; install and run the frontend from `frontend/`.
 
 #### Frontend configuration
 
@@ -141,6 +183,25 @@ REACT_APP_API_BASE_URL=https://api.example.com npm run build
 The deployed frontend's origin must also be listed in the backend's `CORS_ALLOWED_ORIGINS` (see Configuration above), or the browser will block its requests.
 
 **Never put secrets, passwords, API keys or credentials in `REACT_APP_*` variables** - they are bundled into the frontend JavaScript and readable by anyone who loads the page.
+
+---
+
+## 🧪 Testing & CI
+
+Backend tests (from the repository root; they use temporary data files and never touch `backend/*.json`):
+
+```bash
+python -m unittest discover -s backend/tests -t .
+```
+
+Frontend tests and production build (from `frontend/`):
+
+```bash
+CI=true npm test -- --watchAll=false
+npm run build
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request to `main`, on `ubuntu-24.04` with the pinned Python 3.11 and Node 24: it installs the backend dependencies, runs `pip check` and the backend tests, then runs `npm ci`, the frontend tests and the production build.
 
 ---
 
@@ -196,7 +257,7 @@ Set these through your host's environment-variable settings - `.env` files are n
 - **Restarts:** data survives a process restart only if the host preserves the disk. Hosts that replace or reset the filesystem on restart or redeploy lose all stored data.
 - **Redeploys:** `backend/appointments.json` and `backend/reminders.json` are tracked in Git, so a Git-based redeploy can reset them to the repository's version.
 - **Per-conversation state:** an in-progress booking, cancellation or update is isolated per chat session - the frontend sends a random session id with each request, so one visitor's "yes" cannot confirm another visitor's pending action. The session id only separates conversations; it is not authentication. A pending booking, cancellation or update that is still waiting for "yes" or "no" expires after 30 minutes, after which a reply no longer acts on it.
-- **No authentication:** every endpoint is public. `GET /webhook/appointments` and `GET /webhook/reminders` return all stored records to anyone.
+- **No authentication:** every endpoint is public. `GET /webhook/appointments` and `GET /webhook/reminders` return all stored records to anyone, and the Appointments tab and the chat's "view my appointments" show every visitor's active appointments. An appointment can be updated or cancelled by anyone who knows its ID (or, when it is unique, the name on it).
 - **Do not enter real patient or personal information.** Use made-up names and details only.
 
 ---
