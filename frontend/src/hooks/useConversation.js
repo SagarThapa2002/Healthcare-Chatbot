@@ -62,6 +62,8 @@ function deriveUpdateState(envelope, identifier) {
 // and never for the flow's own intent, so "cancel my appointment" stays in
 // the cancellation flow), otherwise null.
 const TASK_SWITCH_INTENTS = ['Book Appointment', ...INTERRUPTION_INTENTS];
+const TIMEOUT_ERROR_TEXT = 'The server took too long to respond. Please try again.';
+const NETWORK_ERROR_TEXT = "We couldn't reach the server. Please check your connection and try again.";
 const LEFT_UNCHANGED_TEXT = "Okay, I've left your appointment unchanged.";
 
 function leaveBeforeConfirm(text, currentFlowIntent) {
@@ -96,6 +98,11 @@ function useConversation() {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  // A request that failed in transport (network, timeout, unreadable
+  // response) - shown as an alert banner rather than as an assistant reply.
+  // Cleared when the next message is sent. A backend reply with
+  // success: false is still shown as a message (sayEnvelope), not here.
+  const [error, setError] = useState(null);
   const [booking, setBooking] = useState(EMPTY_BOOKING);
   // The cancellation flow's ENTIRE local state: which stage the backend
   // last reported it's waiting on. Unlike `booking`, there are no field
@@ -143,6 +150,7 @@ function useConversation() {
   const sendMessage = async (e) => {
     e.preventDefault();
     if (!userInput.trim()) return;
+    setError(null);
 
     const text = userInput;
     setMessages(prev => [...prev, { sender: 'user', text }]);
@@ -527,14 +535,20 @@ function useConversation() {
         sayEnvelope(envelope);
       }
     } catch (err) {
+      // The provider, date, slot and confirm booking steps, and the
+      // cancellation and update steps, change local state only after their
+      // awaited request returns, so a thrown request leaves them exactly as
+      // they were and the user can simply try again. (The name step keeps
+      // the typed name before its request, so after a failure there the
+      // conversation is already at the provider step.)
       console.error(err);
-      sayText('Sorry, an error occurred.');
+      setError(err?.name === 'AbortError' ? TIMEOUT_ERROR_TEXT : NETWORK_ERROR_TEXT);
     } finally {
       setIsTyping(false);
     }
   };
 
-  return { messages, userInput, setUserInput, isTyping, sendMessage };
+  return { messages, userInput, setUserInput, isTyping, sendMessage, error };
 }
 
 export { useConversation };

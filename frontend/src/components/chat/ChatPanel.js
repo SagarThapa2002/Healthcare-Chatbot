@@ -70,7 +70,6 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
       className="flex h-full max-h-[75vh] min-h-[420px] flex-1 flex-col rounded-lg border border-border bg-surface"
     >
       <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-4 sm:px-6">
-        <ErrorBanner message={error} />
         {messages.length === 0 ? (
           <EmptyState onSuggestionSelect={handleSuggestionSelect} disabled={isTyping} />
         ) : (
@@ -98,6 +97,7 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
       </div>
 
       <div className="border-t border-border p-3 sm:p-4">
+        <ErrorBanner message={error} />
         <ChatComposer value={userInput} onChange={setUserInput} onSubmit={sendMessage} disabled={isTyping} />
       </div>
     </section>

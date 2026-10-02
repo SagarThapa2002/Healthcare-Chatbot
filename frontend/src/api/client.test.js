@@ -546,7 +546,7 @@ describe('request timeout during a booking confirmation (rendered Chatbot)', () 
     delete global.fetch;
   });
 
-  test('a timed-out "yes" shows the existing error, re-enables input and keeps the booking at CONFIRM', async () => {
+  test('a timed-out "yes" shows the timeout alert, re-enables input and keeps the booking at CONFIRM', async () => {
     global.fetch = jest.fn()
       .mockReturnValueOnce(reply(envelope('May I have your name?', { bookingStage: 'name' })))
       .mockReturnValueOnce(reply(envelope('Which provider?', { bookingStage: 'provider' })))
@@ -581,7 +581,8 @@ describe('request timeout during a booking confirmation (rendered Chatbot)', () 
 
     expect(intents().at(-1)).toBe('YesIntent');
     expect(input).not.toBeDisabled();
-    expect(screen.getByText('Sorry, an error occurred.', { selector: '[aria-label="Assistant said"]' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('The server took too long to respond. Please try again.');
+    expect(screen.queryByText('Sorry, an error occurred.')).not.toBeInTheDocument();
 
     // The booking was not cleared: interrupting now still discards the
     // backend pending booking first, which only happens at CONFIRM.

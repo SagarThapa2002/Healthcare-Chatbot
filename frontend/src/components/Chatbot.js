@@ -2,7 +2,7 @@ import ChatPanel from './chat/ChatPanel';
 import { useConversation } from '../hooks/useConversation';
 
 function Chatbot() {
-  const { messages, userInput, setUserInput, isTyping, sendMessage } = useConversation();
+  const { messages, userInput, setUserInput, isTyping, sendMessage, error } = useConversation();
 
   return (
     <ChatPanel
@@ -11,6 +11,7 @@ function Chatbot() {
       setUserInput={setUserInput}
       isTyping={isTyping}
       sendMessage={sendMessage}
+      error={error}
     />
   );
 }

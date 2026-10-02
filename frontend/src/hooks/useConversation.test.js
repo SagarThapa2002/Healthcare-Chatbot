@@ -1101,7 +1101,8 @@ describe('interrupting a booking discards the backend pending booking only at CO
     errorSpy.mockRestore();
 
     expect(callBackend.mock.calls.slice(before)).toEqual([['NoIntent', {}]]);
-    expect(botTexts(result).at(-1)).toBe('Sorry, an error occurred.');
+    expect(result.current.error).toBe("We couldn't reach the server. Please check your connection and try again.");
+    expect(botTexts(result)).not.toContain('Sorry, an error occurred.');
     expect(botTexts(result).some((t) => t.includes('Cancelled your in-progress booking'))).toBe(false);
 
     // The booking is still at CONFIRM locally, matching the backend: "yes" confirms it.
@@ -1853,4 +1854,252 @@ describe('recovering from a final slot conflict after "yes"', () => {
       'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:30' }
     ));
   });
+});
+
+// A request that fails in transport (callBackend rejects: network failure,
+// timeout, unreadable response) is shown through the hook's `error` state -
+// an alert banner - not as an assistant message. Booking, cancellation and
+// update state is only updated after a request returns, so a thrown failure
+// leaves the current step exactly as it was.
+describe('transport failures (callBackend rejects)', () => {
+  const NETWORK = "We couldn't reach the server. Please check your connection and try again.";
+  const TIMEOUT = 'The server took too long to respond. Please try again.';
+
+  let errorSpy;
+  beforeEach(() => {
+    callBackend.mockReset();
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  function abortError() {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  function botTexts(result) {
+    return result.current.messages.filter((m) => m.sender === 'bot').map((m) => m.content?.text);
+  }
+
+  test.each([
+    ['TypeError (network)', () => new TypeError('Failed to fetch'), NETWORK],
+    ['AbortError (timeout)', abortError, TIMEOUT],
+    ['SyntaxError (unreadable body)', () => new SyntaxError('Unexpected token < in JSON'), NETWORK],
+  ])('%s sets the error, adds no assistant message, and stops typing', async (label, makeError, expected) => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockRejectedValueOnce(makeError());
+
+    await submitMessage(result, 'What is a balanced diet?');
+
+    expect(result.current.error).toBe(expected);
+    // Only the user's own message: no assistant message (in particular not
+    // the old "Sorry, an error occurred.").
+    expect(result.current.messages.map((m) => m.sender)).toEqual(['user']);
+    expect(result.current.isTyping).toBe(false);
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  test('the error is cleared as soon as the next message is sent, and stays cleared on success', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await submitMessage(result, 'What is a balanced diet?');
+    expect(result.current.error).toBe(NETWORK);
+
+    let resolveRetry;
+    callBackend.mockReturnValueOnce(new Promise((resolve) => { resolveRetry = resolve; }));
+    act(() => {
+      result.current.setUserInput('What is a balanced diet?');
+    });
+    let sending;
+    act(() => {
+      sending = result.current.sendMessage({ preventDefault: () => {} });
+    });
+    expect(result.current.error).toBeNull(); // cleared while the retry is in flight
+
+    await act(async () => {
+      resolveRetry(fakeEnvelope());
+      await sending;
+    });
+    expect(result.current.error).toBeNull();
+    expect(botTexts(result)).toEqual(['ok']);
+  });
+
+  test('an empty submission does not clear the error (no message is sent)', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await submitMessage(result, 'What is a balanced diet?');
+
+    await submitMessage(result, '   ');
+
+    expect(result.current.error).toBe(NETWORK);
+    expect(callBackend).toHaveBeenCalledTimes(1);
+  });
+
+  test('a later failure replaces the previous error', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await submitMessage(result, 'What is a balanced diet?');
+    expect(result.current.error).toBe(NETWORK);
+
+    callBackend.mockRejectedValueOnce(abortError());
+    await submitMessage(result, 'What is a balanced diet?');
+    expect(result.current.error).toBe(TIMEOUT);
+  });
+
+  test('an envelope with success: false is unchanged: shown as an assistant message, no error banner', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce({
+      success: false,
+      error: { code: 'INTERNAL_ERROR', message: 'Oops, something went wrong on the server.' },
+      messages: [],
+      context: null,
+      meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+    });
+
+    await submitMessage(result, 'What is a balanced diet?');
+
+    expect(botTexts(result)).toEqual(['Oops, something went wrong on the server.']);
+    expect(result.current.error).toBeNull();
+  });
+
+  describe('booking state is preserved: the step and accepted fields are unchanged after a thrown failure', () => {
+    test('PROVIDER: the retry is still sent as the provider', async () => {
+      const { result } = renderHook(() => useConversation());
+      await bookThroughToProviderStage(result);
+
+      callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      await submitMessage(result, 'dr-patel');
+      expect(result.current.error).toBe(NETWORK);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('What date?', 'date'));
+      await submitMessage(result, 'dr-patel');
+      expect(callBackend).toHaveBeenLastCalledWith('Book Appointment', { name: 'Sagar', providerId: 'dr-patel' });
+      expect(result.current.error).toBeNull();
+    });
+
+    test('DATE: the retry is still sent as the date, with the provider kept', async () => {
+      const { result } = renderHook(() => useConversation());
+      await bookThroughToProviderStage(result);
+      callBackend.mockResolvedValueOnce(envelopeWithText('What date?', 'date'));
+      await submitMessage(result, 'dr-patel');
+
+      callBackend.mockRejectedValueOnce(abortError());
+      await submitMessage(result, '2026-12-28');
+      expect(result.current.error).toBe(TIMEOUT);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Here are the available times', 'slot'));
+      await submitMessage(result, '2026-12-28');
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28' }
+      );
+    });
+
+    test('SLOT: the retry is still sent as the time, with provider and date kept', async () => {
+      const { result } = renderHook(() => useConversation());
+      await bookThroughToSlotStage(result);
+
+      callBackend.mockRejectedValueOnce(new SyntaxError('Unexpected token <'));
+      await submitMessage(result, '10:00');
+      expect(result.current.error).toBe(NETWORK);
+
+      callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'));
+      await submitMessage(result, '10:00');
+      expect(callBackend).toHaveBeenLastCalledWith(
+        'Book Appointment', { name: 'Sagar', providerId: 'dr-patel', date: '2026-12-28', time: '10:00' }
+      );
+    });
+
+    test('CONFIRM: a failed "yes" keeps the booking at CONFIRM, so the retried "yes" is sent again', async () => {
+      const { result } = renderHook(() => useConversation());
+      await bookThroughToSlotStage(result);
+      callBackend.mockResolvedValueOnce(envelopeWithText('Please confirm (yes or no)', 'confirm'));
+      await submitMessage(result, '10:00');
+
+      callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      await submitMessage(result, 'yes');
+      expect(callBackend).toHaveBeenLastCalledWith('YesIntent', {});
+      expect(result.current.error).toBe(NETWORK);
+
+      const before = callBackend.mock.calls.length;
+      callBackend.mockResolvedValueOnce(envelopeWithText('Your appointment for Sagar has been booked.', 'booked'));
+      await submitMessage(result, 'yes');
+      expect(callBackend.mock.calls.slice(before)).toEqual([['YesIntent', {}]]);
+    });
+  });
+
+  test('cancellation state is preserved: a failed reply at IDENTIFIER is retried as an identifier', async () => {
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation("What's the ID or name?", 'identifier'));
+    await submitMessage(result, 'cancel my appointment');
+
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await submitMessage(result, 'Sagar');
+    expect(result.current.error).toBe(NETWORK);
+
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, 'Sagar');
+    expect(callBackend).toHaveBeenLastCalledWith('Cancel Appointment', { name: 'Sagar' });
+
+    // ...and a failed "yes" at CONFIRM keeps it at CONFIRM.
+    callBackend.mockRejectedValueOnce(abortError());
+    await submitMessage(result, 'yes');
+    callBackend.mockResolvedValueOnce(envelopeWithCancellation('Cancelled.', 'cancelled'));
+    await submitMessage(result, 'yes');
+    expect(callBackend.mock.calls.slice(-2)).toEqual([['YesIntent', {}], ['YesIntent', {}]]);
+  });
+
+  test('update state is preserved: a failed reply at FIELDS is retried as fields for the same appointment', async () => {
+    const id = 'b3f2c9a0-1e2d-4b3a-9c1d-8e7f6a5b4c3d';
+    const { result } = renderHook(() => useConversation());
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate("What's the ID or name?", 'identifier'));
+    await submitMessage(result, 'update my appointment');
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('What new date or time?', 'fields'));
+    await submitMessage(result, id);
+
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await submitMessage(result, '2026-12-30');
+    expect(result.current.error).toBe(NETWORK);
+
+    callBackend.mockResolvedValueOnce(envelopeWithUpdate('Please confirm (yes or no)', 'confirm'));
+    await submitMessage(result, '2026-12-30');
+    expect(callBackend).toHaveBeenLastCalledWith('Update Appointment', { id, date: '2026-12-30' });
+  });
+});
+
+describe('transport failure banner (rendered Chatbot)', () => {
+  let errorSpy;
+  beforeEach(() => {
+    callBackend.mockReset();
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  async function send(value) {
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox'), { target: { value } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form'));
+  }
+
+  test('a rejected request shows the alert, re-enables the input, and a successful retry removes it', async () => {
+    render(<Chatbot />);
+    callBackend.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await send('What is a balanced diet?');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "We couldn't reach the server. Please check your connection and try again."
+    );
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    expect(screen.queryByText('Sorry, an error occurred.')).not.toBeInTheDocument();
+
+    callBackend.mockResolvedValueOnce(fakeEnvelope());
+    await send('What is a balanced diet?');
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(await screen.findByText('ok', { selector: '[aria-label="Assistant said"]' })).toBeInTheDocument();
+  });
+
+  // The rendered timeout case is covered end to end (a real request aborted
+  // by fetchWithTimeout) in client.test.js.
 });

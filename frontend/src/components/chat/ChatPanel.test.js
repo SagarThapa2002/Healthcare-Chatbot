@@ -54,6 +54,27 @@ describe('ChatPanel', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Sorry, an error occurred.');
   });
 
+  test('renders the error banner directly above the composer, outside the scrolling message list', () => {
+    const messages = Array.from({ length: 30 }, (_, i) => (
+      { sender: 'bot', type: 'text', content: { text: `Message ${i}` }, suggestions: [] }
+    ));
+    render(
+      <ChatPanel
+        messages={messages}
+        userInput=""
+        setUserInput={jest.fn()}
+        isTyping={false}
+        sendMessage={jest.fn()}
+        error="We couldn't reach the server."
+      />
+    );
+    const alert = screen.getByRole('alert');
+    const form = screen.getByRole('textbox').closest('form');
+    expect(alert.nextElementSibling).toBe(form);
+    expect(alert.parentElement).toBe(form.parentElement);
+    expect(within(alert.parentElement).queryAllByRole('group', { name: /assistant said/i })).toHaveLength(0);
+  });
+
   test('sends a suggestion value through the existing sendMessage flow', () => {
     const sendMessage = jest.fn((e) => e.preventDefault());
     const setUserInput = jest.fn();
