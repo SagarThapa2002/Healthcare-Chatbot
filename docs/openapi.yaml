@@ -387,7 +387,12 @@ components:
         bookingStage:
           type: string
           enum: [name, provider, date, slot, confirm, booked]
-          description: What the booking flow is now waiting on, or `booked` once an appointment has been persisted.
+          description: >-
+            What the booking flow is now waiting on, or `booked` once an appointment has been persisted.
+            A `YesIntent` whose final availability re-check finds the slot already taken reports `slot`
+            (with that date's current times), or `date` if that date has no times left; the pending
+            booking is discarded, so the booking continues from that step with a new `Book Appointment`
+            request. Other `YesIntent` failures omit `bookingStage`.
         updateStage:
           type: string
           enum: [identifier, fields, confirm, updated]

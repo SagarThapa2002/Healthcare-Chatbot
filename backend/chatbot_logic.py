@@ -790,11 +790,12 @@ def _handle_yes_intent():
     record that's missing one (see the guard below) - that record simply
     cannot be confirmed by this flow.
 
-    On any failure (missing fields, a data problem availability_service
-    itself refuses to guess about, or a genuinely-taken slot), the
-    pending record is deliberately left in place - only a successful
-    confirmation (or an explicit "no") clears it - and no appointment is
-    appended.
+    On any failure no appointment is appended. When the slot has
+    genuinely been taken, the pending record is removed and the booking
+    flow continues from the slot step (see _recover_from_taken_slot).
+    For the other failures (missing fields, a data problem
+    availability_service itself refuses to guess about) the pending
+    record is left in place, unchanged.
 
     Next Phase 6.1 slice: a stable `id` (str(uuid.uuid4()), matching
     response_model._new_request_id()'s existing convention) is generated
@@ -808,11 +809,10 @@ def _handle_yes_intent():
 
     Returns (messages, booking_stage) - Phase 6.1, Slice 3, Step 4
     (revised): reports "booked" only for a genuine successful
-    confirmation. Every failure path reports None (no booking_stage) -
-    the frontend already unconditionally resets its local booking state
-    after any "yes"/"no" reply regardless of outcome, so none of these
-    failure cases need a stage label for that existing behavior to work;
-    None simply omits `bookingStage` from the response (see
+    confirmation, and the stage the booking flow is now waiting on
+    ("slot", or "date" if that day has no times left) for a taken slot.
+    Every other failure path reports None (no booking_stage), which
+    simply omits `bookingStage` from the response (see
     response_model.success_response's docstring).
     """
     if os.path.exists(_pending_booking_file()):
@@ -842,11 +842,7 @@ def _handle_yes_intent():
             return [response_model.text_message(text)], None
 
         if not slot_still_available:
-            text = (
-                "Sorry, that time is no longer available - it looks like it was just booked. "
-                "Please choose another time or date."
-            )
-            return [response_model.text_message(text)], None
+            return _recover_from_taken_slot(appointment)
 
         appointments = []
         if os.path.exists(APPOINTMENTS_FILE):
@@ -870,6 +866,36 @@ def _handle_yes_intent():
 
     text = "There is no appointment pending confirmation."
     return [response_model.text_message(text)], None
+
+
+def _recover_from_taken_slot(appointment):
+    """The final re-check found the pending booking's slot already taken.
+
+    Removes the pending booking, so a later bare "yes" can never confirm
+    it (if the slot were freed again), and nothing pending is left behind
+    if the user then leaves the booking - pending state exists only at
+    the confirmation step. Recovery then runs through the ordinary
+    booking flow: _handle_book_appointment is asked again with the same
+    name/provider/date and no time, so it re-checks that day itself and
+    reports what it needs next - "slot" with the current times (the taken
+    one is no longer among them), or "date" if the day has none left.
+    The conflict is stated in front of that reply's first message.
+    Nothing is persisted here; the caller resends every field on its next
+    Book Appointment, which writes a new pending booking only on reaching
+    "confirm" again.
+    """
+    os.remove(_pending_booking_file())
+    messages, booking_stage = _handle_book_appointment({
+        "name": appointment.get("name"),
+        "providerId": appointment["providerId"],
+        "date": appointment["date"],
+    })
+    first = messages[0]
+    first["content"]["text"] = (
+        "Sorry, that time is no longer available - it looks like it was just booked. "
+        + first["content"]["text"]
+    )
+    return messages, booking_stage
 
 
 def _booked_provider_phrase(provider_id):

@@ -582,13 +582,15 @@ class ConfirmationAvailabilityRecheckTest(BookingFlowTestCase):
             saved = json.load(f)
         self.assertEqual(saved, conflicting)
 
-    def test_pending_remains_for_recovery_when_slot_is_rejected(self):
+    def test_pending_is_removed_when_slot_is_rejected(self):
+        # Recovery restarts from the slot step through the ordinary booking
+        # flow (see FinalSlotConflictRecoveryTest), so the stale pending
+        # booking is not kept for it.
         self.post_webhook(
             "Book Appointment",
             {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
         )
-        with open(self.pending_file, 'r') as f:
-            pending_before = json.load(f)
+        self.assertTrue(os.path.exists(self.pending_file))
 
         with open(self.appointments_file, 'w') as f:
             json.dump(
@@ -599,10 +601,7 @@ class ConfirmationAvailabilityRecheckTest(BookingFlowTestCase):
 
         self.post_webhook("YesIntent")
 
-        self.assertTrue(os.path.exists(self.pending_file))
-        with open(self.pending_file, 'r') as f:
-            pending_after = json.load(f)
-        self.assertEqual(pending_after, pending_before)
+        self.assertFalse(os.path.exists(self.pending_file))
 
     def test_pending_missing_provider_id_is_rejected_safely_not_guessed(self):
         # Simulates a stale/legacy pending record predating Step 2's
@@ -785,7 +784,7 @@ class BookingStageContractTest(BookingFlowTestCase):
         response = self.post_webhook("YesIntent")
         self.assertNotIn("bookingStage", response.get_json()["context"])
 
-    def test_yes_intent_race_rejection_omits_booking_stage(self):
+    def test_yes_intent_race_rejection_reports_slot_stage(self):
         self.post_webhook(
             "Book Appointment",
             {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"},
@@ -797,7 +796,7 @@ class BookingStageContractTest(BookingFlowTestCase):
                 f,
             )
         response = self.post_webhook("YesIntent")
-        self.assertNotIn("bookingStage", response.get_json()["context"])
+        self.assertEqual(self._stage(response), "slot")
 
     def test_non_booking_intents_never_carry_a_booking_stage(self):
         for intent, params in [
@@ -810,6 +809,159 @@ class BookingStageContractTest(BookingFlowTestCase):
             with self.subTest(intent=intent):
                 response = self.post_webhook(intent, params)
                 self.assertNotIn("bookingStage", response.get_json()["context"])
+
+
+class FinalSlotConflictRecoveryTest(BookingFlowTestCase):
+    """The final availability re-check in _handle_yes_intent finds the
+    pending booking's slot already taken. The pending booking is removed,
+    nothing is persisted, and the reply reports the stage the booking flow
+    now needs - "slot" with the current times for the same date, or "date"
+    if that day has none left - so recovery runs through the ordinary
+    booking flow. Assertions use structured fields and persisted state;
+    the only wording checked is that the conflict is still stated.
+    """
+
+    PARAMS = {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28", "time": "10:00"}
+    OTHER = {"name": "Someone Else", "providerId": "dr-patel", "date": "2026-12-28",
+             "time": "10:00", "status": "booked"}
+    SESSION_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SESSION_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def post(self, intent, parameters=None, session=None):
+        body = {"queryResult": {"intent": {"displayName": intent}, "parameters": parameters or {}}}
+        if session:
+            body["session"] = session
+        return self.client.post('/webhook/webhook', json=body).get_json()
+
+    def _seed(self, appointments):
+        with open(self.appointments_file, 'w') as f:
+            json.dump(appointments, f)
+
+    def _saved(self):
+        with open(self.appointments_file) as f:
+            return json.load(f)
+
+    def _session_pending(self, session):
+        return os.path.join(self.tmp_dir.name, f"pending_appointments.{session}.json")
+
+    def _reach_confirm_then_lose_the_slot(self, session=None):
+        confirm = self.post("Book Appointment", self.PARAMS, session)
+        self.assertEqual(confirm["context"]["bookingStage"], "confirm")
+        self._seed([self.OTHER])
+        return self.post("YesIntent", session=session)
+
+    def test_slot_conflict_reports_slot_with_the_current_options(self):
+        rejected = self._reach_confirm_then_lose_the_slot()
+
+        self.assertTrue(rejected["success"])
+        self.assertEqual(rejected["context"], {"intent": "YesIntent", "bookingStage": "slot"})
+        self.assertEqual(len(rejected["messages"]), 1)
+        message = rejected["messages"][0]
+        self.assertEqual(message["type"], "text")
+        self.assertIn("no longer available", message["content"]["text"])
+        expected = availability_service.get_available_slots("dr-patel", "2026-12-28")
+        self.assertNotIn("10:00", expected)
+        self.assertEqual([s["value"] for s in message["suggestions"]], expected)
+
+    def test_slot_conflict_removes_the_pending_booking_and_persists_nothing(self):
+        self._reach_confirm_then_lose_the_slot()
+
+        self.assertFalse(os.path.exists(self.pending_file))
+        self.assertEqual(self._saved(), [self.OTHER])
+
+    def test_conflict_on_a_now_fully_booked_day_reports_date(self):
+        self.assertEqual(self.post("Book Appointment", self.PARAMS)["context"]["bookingStage"], "confirm")
+        self._fill_every_slot("dr-patel", "2026-12-28")
+        filled = self._saved()
+
+        rejected = self.post("YesIntent")
+
+        self.assertEqual(rejected["context"].get("bookingStage"), "date")
+        self.assertIn("no longer available", rejected["messages"][0]["content"]["text"])
+        self.assertEqual(rejected["messages"][0]["suggestions"], [])
+        self.assertFalse(os.path.exists(self.pending_file))
+        self.assertEqual(self._saved(), filled)
+
+    def test_a_bare_yes_after_a_conflict_cannot_confirm_the_stale_booking(self):
+        self._reach_confirm_then_lose_the_slot()
+        self._seed([])  # the other booking goes away, freeing 10:00 again
+
+        later = self.post("YesIntent")
+
+        self.assertNotIn("bookingStage", later["context"])
+        self.assertEqual(later["messages"][0]["type"], "text")
+        self.assertEqual(self._saved(), [])
+        self.assertFalse(os.path.exists(self.pending_file))
+
+    def test_recovery_through_the_normal_flow_books_the_replacement_time(self):
+        self._reach_confirm_then_lose_the_slot()
+
+        retry = self.post("Book Appointment", {**self.PARAMS, "time": "10:30"})
+        self.assertEqual(retry["context"]["bookingStage"], "confirm")
+        self.assertTrue(os.path.exists(self.pending_file))
+
+        booked = self.post("YesIntent")
+        self.assertEqual(booked["context"]["bookingStage"], "booked")
+        self.assertFalse(os.path.exists(self.pending_file))
+        saved = self._saved()
+        self.assertEqual(saved[0], self.OTHER)
+        self.assertEqual(
+            [(a["name"], a["providerId"], a["date"], a["time"]) for a in saved[1:]],
+            [("Test Patient", "dr-patel", "2026-12-28", "10:30")],
+        )
+
+    def test_missing_fields_failure_is_unchanged(self):
+        pending = {"name": "Test Patient", "providerId": "dr-patel", "date": "2026-12-28"}
+        with open(self.pending_file, 'w') as f:
+            json.dump(pending, f)
+
+        response = self.post("YesIntent")
+
+        self.assertNotIn("bookingStage", response["context"])
+        self.assertEqual(response["messages"][0]["suggestions"], [])
+        with open(self.pending_file) as f:
+            self.assertEqual(json.load(f), pending)
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_availability_error_is_unchanged(self):
+        self.post("Book Appointment", self.PARAMS)
+        with open(self.pending_file) as f:
+            pending = json.load(f)
+        error = availability_service.AvailabilityError("bad data")
+        with patch.object(availability_service, 'is_slot_available', side_effect=error):
+            with self.assertLogs('backend.chatbot_logic', level='WARNING'):
+                response = self.post("YesIntent")
+
+        self.assertTrue(response["success"])
+        self.assertNotIn("bookingStage", response["context"])
+        self.assertEqual(response["messages"][0]["suggestions"], [])
+        with open(self.pending_file) as f:
+            self.assertEqual(json.load(f), pending)
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_no_pending_booking_is_unchanged(self):
+        response = self.post("YesIntent")
+        self.assertNotIn("bookingStage", response["context"])
+        self.assertFalse(os.path.exists(self.pending_file))
+        self.assertFalse(os.path.exists(self.appointments_file))
+
+    def test_a_conflict_in_one_session_leaves_another_sessions_pending_booking_alone(self):
+        other_params = {**self.PARAMS, "name": "Visitor B", "time": "11:00"}
+        self.assertEqual(
+            self.post("Book Appointment", other_params, self.SESSION_B)["context"]["bookingStage"], "confirm"
+        )
+        with open(self._session_pending(self.SESSION_B)) as f:
+            pending_b = json.load(f)
+
+        rejected = self._reach_confirm_then_lose_the_slot(session=self.SESSION_A)
+
+        self.assertEqual(rejected["context"]["bookingStage"], "slot")
+        self.assertFalse(os.path.exists(self._session_pending(self.SESSION_A)))
+        with open(self._session_pending(self.SESSION_B)) as f:
+            self.assertEqual(json.load(f), pending_b)
+        booked = self.post("YesIntent", session=self.SESSION_B)
+        self.assertEqual(booked["context"]["bookingStage"], "booked")
+        self.assertEqual([a["time"] for a in self._saved()], ["10:00", "11:00"])
 
 
 class AppointmentIdTest(BookingFlowTestCase):
@@ -1558,10 +1710,12 @@ class BookingSuggestionsTest(BookingFlowTestCase):
         self._book("Someone Else", "10:00")
 
         rejected = self.post_webhook("YesIntent")
-        self.assertIsNone(self._stage(rejected))
+        self.assertEqual(self._stage(rejected), "slot")
         self.assertIn("no longer available", self._message(rejected)["content"]["text"])
-        self.assertEqual(self._suggestions(rejected), [])
-        self.assertTrue(os.path.exists(self.pending_file))
+        values = [s["value"] for s in self._suggestions(rejected)]
+        self.assertTrue(values)
+        self.assertNotIn("10:00", values)
+        self.assertFalse(os.path.exists(self.pending_file))
 
     def test_cancel_and_update_confirm_prompts_do_not_gain_yes_no_suggestions(self):
         self._reach_confirm()
