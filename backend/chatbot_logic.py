@@ -28,6 +28,7 @@ import uuid
 from backend import assistant_service
 from backend import atomic_json
 from backend import availability_service
+from backend import emergency_signposting
 from backend import llm_config
 from backend import provider_repository
 from backend import reminder_config
@@ -306,7 +307,14 @@ def _dispatch_webhook_request(payload, request_id=None):
     # pending update (see below) ever set this.
     update_stage = None
 
-    if intent == "Symptom Check":
+    # Emergency signposting runs first for the two intents that carry the
+    # user's free text, before their handlers - so a red-flag message never
+    # gets the ordinary symptom reply and never reaches the LLM.
+    emergency_reply = _emergency_reply(intent, parameters)
+
+    if emergency_reply:
+        messages = [response_model.text_message(emergency_reply)]
+    elif intent == "Symptom Check":
         messages = _handle_symptom_check(parameters)
     elif intent == "Book Appointment":
         messages, booking_stage = _handle_book_appointment(parameters)
@@ -405,10 +413,31 @@ def _handle_ambiguous_pending_transactions():
     return [response_model.text_message(text)]
 
 
+def _emergency_reply(intent, parameters):
+    """The fixed emergency signposting reply (see emergency_signposting.py)
+    for a Symptom Check or General FAQ request whose free text - `symptom` or
+    `message` - contains a red-flag phrase, else None. Other intents carry no
+    free text and are never checked.
+    """
+    if intent not in ("Symptom Check", "General FAQ") or not isinstance(parameters, dict):
+        return None
+    for key in ("symptom", "message"):
+        reply = emergency_signposting.signpost(parameters.get(key))
+        if reply:
+            return reply
+    return None
+
+
 def _handle_symptom_check(parameters):
     symptom = parameters.get('symptom')
     if symptom:
-        text = f"Thanks for sharing. Since you're experiencing {symptom}, I recommend keeping an eye on it. If it worsens, please consider visiting a healthcare provider."
+        # Generic signposting only: no diagnosis, no "wait and see", and the
+        # user's text is not echoed back.
+        text = (
+            "Thanks for telling me. I can't diagnose symptoms or tell you what's causing them. "
+            "If you're worried, or your symptoms are getting worse or not improving, contact your "
+            "GP or call NHS 111. If you think it's an emergency, call 999. (UK numbers.)"
+        )
     else:
         text = "Could you please tell me your symptom so I can assist you better?"
     return [response_model.text_message(text)]

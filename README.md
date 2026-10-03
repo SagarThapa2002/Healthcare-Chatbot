@@ -19,7 +19,8 @@ It is **not** a clinical tool: it does not diagnose, has no authentication, and 
 
 This project demonstrates a healthcare chatbot that:
 
-- Accepts symptom-related messages and replies with a fixed, generic suggestion to monitor the symptom and see a healthcare provider if it worsens (no triage or diagnosis)
+- Accepts symptom-related messages and replies with fixed, generic signposting to a GP, NHS 111 or 999 (no triage or diagnosis)
+- Answers a small set of explicit emergency phrases (for example severe chest pain, not being able to breathe, poisoning, suicidal thoughts) with fixed UK emergency signposting (999, NHS 111, Samaritans 116 123), before any other reply and never via the LLM
 - Books appointments through a step-by-step chat flow with a choice of provider, date and time slot, checked against provider availability by the backend
 - Lets users view, update (date/time) and cancel appointments through chat
 - Performs intent detection in the frontend via keyword/pattern matching (`frontend/src/conversation/intent.js`); the backend webhook contract mirrors the Dialogflow ES fulfillment format, but Dialogflow is not currently wired in at runtime (see `dialogflow/README.md`)
@@ -33,7 +34,10 @@ This project demonstrates a healthcare chatbot that:
 ## 💡 Features
 
 - **Symptom Checker**
-  Messages containing a symptom keyword (e.g. `I have a headache`, `I'm feeling dizzy`) get a fixed, generic reply suggesting the user keep an eye on the symptom and see a healthcare provider if it worsens. It does not assess urgency or diagnose; the triage module described above is not connected.
+  Messages containing a symptom keyword (e.g. `I have a headache`, `I'm feeling dizzy`) get a fixed, generic reply: the chatbot can't diagnose; contact a GP or NHS 111 if worried or if things get worse, and call 999 in an emergency. It does not assess urgency or diagnose, does not repeat the user's message back, and the triage module described above is not connected.
+
+- **Emergency Signposting**
+  Before any symptom reply or general answer, the backend checks the message against a deliberately small, sourced set of explicit red-flag phrases in three groups - a physical emergency (e.g. crushing chest pain, can't breathe), poisoning or overdose, and suicide or self-harm. A match gets a fixed reply pointing to 999, NHS 111 or Samaritans 116 123 (UK services), and never reaches the LLM. **This is signposting, not an emergency detector:** the chatbot is not an emergency service, the phrase list is limited, and no match does not mean a situation is safe. Text typed into a booking, cancellation or update step is not checked. Sources and the full rule summary: `backend/SYMPTOM_RULES_SOURCES.md`.
 
 - **Appointment Booking**
   A guided chat flow: name → provider → date → time slot → confirmation (see [Booking flow](#-booking-flow)). It can start from one sentence, e.g. `Book an appointment for John on 26 December 2026 at 10am`; the provider is always asked for separately. Provider chips and time-slot chips can be clicked instead of typed.
@@ -71,7 +75,7 @@ React frontend (frontend/)                         Flask backend (app.py + backe
 - **Frontend:** `frontend/src/conversation/intent.js` classifies each message with keyword/pattern matching and `useConversation.js` sends it, with the fields collected so far, to the backend through `frontend/src/api/client.js`. The client adds a random per-page-load `session` id and aborts any request that takes longer than 35 seconds; a failed or timed-out request shows a generic error message in the chat and re-enables the input.
 - **Backend:** every reply uses one response envelope (`success`, `error`, `messages`, `context`, `meta`), and `POST /webhook/webhook` returns HTTP 200 even for errors (see [API Contract](#-api-contract-openapi)). The backend is the authority for everything that matters: it resolves providers, computes available slots from `backend/provider_availability.json`, re-checks availability before saving, and writes all data. The frontend never computes availability.
 - **Conversation state:** `context.bookingStage`, `context.updateStage` and `context.cancellationStage` tell the frontend which step the backend is waiting on; the frontend only advances when the backend reports it. An in-progress booking, update or cancellation awaiting "yes"/"no" is stored per `session` and expires after 30 minutes.
-- **LLM boundary:** only messages that match no other intent ("General FAQ") can reach the optional LLM, and `backend/assistant_service.py` deterministically refuses appointment actions, diagnosis, medication and treatment requests before any call, then scans the model's output (see `backend/LLM_ASSISTANT_NOTES.md`). With `LLM_ENABLED` unset (the default) these messages get a fixed greeting.
+- **LLM boundary:** only messages that match no other intent ("General FAQ") and no emergency phrase (see Emergency Signposting) can reach the optional LLM, and `backend/assistant_service.py` deterministically refuses appointment actions, diagnosis, medication and treatment requests before any call, then scans the model's output (see `backend/LLM_ASSISTANT_NOTES.md`). With `LLM_ENABLED` unset (the default) these messages get a fixed greeting.
 - **Logging:** metadata only (request id, intent, outcome labels, exception class names) - never message text, names, prompts, model output or exception messages (see `backend/LOGGING_NOTES.md`).
 
 ---
