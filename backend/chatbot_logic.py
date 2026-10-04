@@ -19,6 +19,7 @@ re-validate-before-write safety check is a later step, not this one. See
 backend/PROVIDER_AVAILABILITY_NOTES.md.
 """
 import contextvars
+import datetime
 import json
 import logging
 import os
@@ -621,6 +622,33 @@ _DATE_FULLY_BOOKED = "fully_booked"
 _DATE_HAS_SLOTS = "has_slots"
 
 
+def _today():
+    """Today's date in the clinic's timezone (CLINIC_TIMEZONE, the same
+    setting reminders use), or the server's local date when that is not
+    configured. Appointment dates are clinic-local calendar dates, so this
+    is what "in the past" is measured against. Tests patch this function
+    rather than the system clock.
+    """
+    try:
+        return datetime.datetime.now(reminder_config.get_clinic_timezone()).date()
+    except reminder_config.ReminderConfigError:
+        return datetime.date.today()
+
+
+def _is_past_date(value):
+    """True only for a well-formed date (parsed exactly as
+    availability_service does) that is before _today(). Anything malformed
+    is left to the existing availability checks and their own messages.
+    """
+    try:
+        return datetime.date.fromisoformat(value) < _today()
+    except (TypeError, ValueError):
+        return False
+
+
+_PAST_DATE_TEXT = "That date has already passed. Could you choose today or a later date? (YYYY-MM-DD)"
+
+
 def _check_date_availability(provider_id, date):
     """Determines whether provider_id has any bookable slot on `date`, and
     if not, which of two distinct reasons applies - without duplicating
@@ -792,6 +820,11 @@ def _handle_book_appointment(parameters):
         text = f"What date would you like to see {provider_name}? (YYYY-MM-DD)"
         return [response_model.text_message(text)], "date"
 
+    # A past date is never bookable, whatever the provider's schedule says -
+    # checked on every request that carries a date, including the slot step.
+    if _is_past_date(date):
+        return [response_model.text_message(_PAST_DATE_TEXT)], "date"
+
     try:
         status, _ = _check_date_availability(provider_id, date)
     except availability_service.AvailabilityError as e:
@@ -911,6 +944,14 @@ def _handle_yes_intent():
                 "Please choose a provider, date, and time again."
             )
             return [response_model.text_message(text)], None
+
+        # The date was checked when it was chosen, but the clinic date may
+        # have moved on since (e.g. past midnight). A now-past booking is
+        # discarded, nothing is saved, and the booking continues from the
+        # date step - the frontend keeps the name and provider.
+        if _is_past_date(date):
+            os.remove(_pending_booking_file())
+            return [response_model.text_message(_PAST_DATE_TEXT)], "date"
 
         try:
             slot_still_available = availability_service.is_slot_available(provider_id, date, time)
@@ -1254,6 +1295,10 @@ def _handle_update_appointment(parameters):
     check_date = new_date or selected['date']
     check_time = new_time or selected['time']
 
+    # An update can never leave the appointment on a past date.
+    if _is_past_date(check_date):
+        return [response_model.text_message(_PAST_DATE_TEXT)], _UPDATE_STAGE_FIELDS
+
     ok, error_text = _check_update_availability(selected, appointments, check_date, check_time)
     if not ok:
         return [response_model.text_message(error_text)], _UPDATE_STAGE_FIELDS
@@ -1332,6 +1377,13 @@ def _handle_update_confirm_yes():
     new_time = pending.get('newTime')
     check_date = new_date or target['date']
     check_time = new_time or target['time']
+
+    # The target date may have become past since it was checked (e.g. past
+    # midnight): nothing is changed, the pending update is discarded, and
+    # the update continues from the fields step for the same appointment.
+    if _is_past_date(check_date):
+        os.remove(_pending_update_file())
+        return [response_model.text_message(_PAST_DATE_TEXT)], _UPDATE_STAGE_FIELDS
 
     ok, error_text = _check_update_availability(target, appointments, check_date, check_time)
     if not ok:

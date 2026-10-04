@@ -13,7 +13,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from app import app
@@ -714,8 +714,11 @@ class ReminderIntegrationTestCase(unittest.TestCase):
         # afternoon through Sunday would find no such slot at all).
         # 2020-01-01 is a Wednesday - a valid, always-bookable slot day -
         # and is unambiguously both "less than 24h away" and "in the
-        # past" by the time this test runs.
-        appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
+        # past" by the time this test runs. Booking rejects past dates, so
+        # the booking's "today" is set to that day; reminder eligibility is
+        # still measured against the real clock.
+        with patch.object(chatbot_logic, '_today', return_value=date(2020, 1, 1)):
+            appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
 
         self.assertTrue(appointment.get("id"))
         self.assertEqual(self._read_reminders(), [])
@@ -754,8 +757,10 @@ class ReminderIntegrationTestCase(unittest.TestCase):
         # A past-dated appointment is not reminder-eligible (see
         # reminder_service.is_eligible_for_reminder), so booking one
         # leaves nothing pending - exercising cancel_pending_reminder's
-        # own documented safe no-op for that case.
-        appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
+        # own documented safe no-op for that case. (Booking rejects past
+        # dates, so the booking's "today" is set to that day.)
+        with patch.object(chatbot_logic, '_today', return_value=date(2020, 1, 1)):
+            appointment = self._book_and_confirm(date="2020-01-01", time="10:00")
         self.assertEqual(self._read_reminders(), [])
 
         self.post_webhook("Cancel Appointment", {"id": appointment["id"]})
