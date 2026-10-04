@@ -207,3 +207,90 @@ describe('ChatPanel backend-provided suggestions', () => {
     expect(within(groups[0]).getByRole('button', { name: 'Book an appointment' })).toBeInTheDocument();
   });
 });
+
+// What a browser does when a focused element becomes disabled: focus moves
+// to the page body. jsdom does not do this, and will not blur an element that
+// is already disabled, so the element is briefly re-enabled to blur it; its
+// disabled state is unchanged afterwards.
+function simulateBrowserFocusLoss(element) {
+  const wasDisabled = element.disabled;
+  element.disabled = false;
+  element.blur();
+  element.disabled = wasDisabled;
+}
+
+// While a reply is pending the composer is disabled, and browsers move focus
+// off a disabled element; these tests reproduce that with
+// simulateBrowserFocusLoss while the request is pending.
+describe('ChatPanel composer focus after a reply', () => {
+  function renderPanel() {
+    const sendMessage = jest.fn((e) => e.preventDefault());
+    const props = {
+      messages: [], userInput: 'Hello', setUserInput: jest.fn(), isTyping: false, sendMessage,
+    };
+    const utils = render(<ChatPanel {...props} />);
+    const update = (changes) => utils.rerender(<ChatPanel {...props} {...changes} />);
+    return { sendMessage, update, textarea: screen.getByRole('textbox') };
+  }
+
+  let elsewhere;
+  afterEach(() => {
+    elsewhere?.remove();
+    elsewhere = null;
+  });
+
+  test('is not focused automatically on first render', () => {
+    renderPanel();
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  test('Enter in the composer: focus returns to the composer when the reply arrives', () => {
+    const { sendMessage, update, textarea } = renderPanel();
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    update({ isTyping: true, userInput: '' });
+    simulateBrowserFocusLoss(textarea);
+    expect(document.activeElement).toBe(document.body);
+    update({ isTyping: false, userInput: '' });
+
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test('Send button: focus returns to the composer when the reply arrives', () => {
+    const { sendMessage, update, textarea } = renderPanel();
+    const send = screen.getByRole('button', { name: /send/i });
+    send.focus();
+    fireEvent.click(send);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    update({ isTyping: true, userInput: '' });
+    simulateBrowserFocusLoss(send);
+    expect(document.activeElement).toBe(document.body);
+    update({ isTyping: false, userInput: '' });
+
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test('focus moved to another control while waiting is left there', () => {
+    const { update, textarea } = renderPanel();
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    update({ isTyping: true, userInput: '' });
+
+    elsewhere = document.createElement('button');
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    update({ isTyping: false, userInput: '' });
+
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  test('a reply to a message not sent from the chat does not take focus', () => {
+    const { update } = renderPanel();
+    update({ isTyping: true });
+    update({ isTyping: false });
+    expect(document.activeElement).toBe(document.body);
+  });
+});

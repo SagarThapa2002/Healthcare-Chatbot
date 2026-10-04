@@ -11,6 +11,33 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
   const scrollRef = useRef(null);
   const isNearBottomRef = useRef(true);
   const pendingSuggestionRef = useRef(false);
+  const composerInputRef = useRef(null);
+  // Set when a message is sent from the composer or a suggestion chip, so
+  // focus can go back to the composer once the reply arrives (see below).
+  const restoreFocusRef = useRef(false);
+  const wasTypingRef = useRef(isTyping);
+
+  // While a request is pending the composer is disabled, and browsers move
+  // focus off a disabled element (a clicked chip is removed outright), so a
+  // keyboard user would have to click back in after every message. When the
+  // request finishes, focus returns to the composer - but only if this send
+  // came from the composer or a chip AND focus is now nowhere (the page
+  // body). If the user moved to another control meanwhile, it is left there.
+  useEffect(() => {
+    const finished = wasTypingRef.current && !isTyping;
+    wasTypingRef.current = isTyping;
+    if (!finished || !restoreFocusRef.current) return;
+    restoreFocusRef.current = false;
+    const active = document.activeElement;
+    if (!active || active === document.body) {
+      composerInputRef.current?.focus();
+    }
+  }, [isTyping]);
+
+  const handleComposerSubmit = (e) => {
+    restoreFocusRef.current = true;
+    sendMessage(e);
+  };
 
   // Auto-scroll to the latest message, but only when the user was already
   // near the bottom - so reading older messages isn't interrupted.
@@ -42,6 +69,7 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
 
   const handleSuggestionSelect = (value) => {
     pendingSuggestionRef.current = true;
+    restoreFocusRef.current = true;
     setUserInput(value);
   };
 
@@ -98,7 +126,13 @@ function ChatPanel({ messages, userInput, setUserInput, isTyping, sendMessage, e
 
       <div className="border-t border-border p-3 sm:p-4">
         <ErrorBanner message={error} />
-        <ChatComposer value={userInput} onChange={setUserInput} onSubmit={sendMessage} disabled={isTyping} />
+        <ChatComposer
+          value={userInput}
+          onChange={setUserInput}
+          onSubmit={handleComposerSubmit}
+          disabled={isTyping}
+          inputRef={composerInputRef}
+        />
       </div>
     </section>
   );

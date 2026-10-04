@@ -2339,3 +2339,124 @@ describe('structured success: false keeps the current step (outcome unknown)', (
     expect(result.current.error).toBeNull();
   });
 });
+
+// What a browser does when a focused element becomes disabled: focus moves
+// to the page body. jsdom does not do this, and will not blur an element that
+// is already disabled, so the element is briefly re-enabled to blur it; its
+// disabled state is unchanged afterwards.
+function simulateBrowserFocusLoss(element) {
+  const wasDisabled = element.disabled;
+  element.disabled = false;
+  element.blur();
+  element.disabled = wasDisabled;
+}
+
+// The full Chatbot (real hook, mocked callBackend): once a reply arrives -
+// whatever its outcome - focus returns to the composer if the message was
+// sent from the composer or a chip. Each test reproduces the browser's focus
+// loss with simulateBrowserFocusLoss while the request is pending.
+describe('composer focus after each kind of reply (rendered Chatbot)', () => {
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  let errorSpy;
+  beforeEach(() => {
+    callBackend.mockReset();
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  async function sendWithEnterAndLoseFocus(text) {
+    const textarea = screen.getByRole('textbox');
+    textarea.focus();
+    fireEvent.change(textarea, { target: { value: text } });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    await waitFor(() => expect(textarea).toBeDisabled());
+    act(() => simulateBrowserFocusLoss(textarea));
+    expect(document.activeElement).toBe(document.body);
+    expect(textarea).toBeDisabled();
+    return textarea;
+  }
+
+  test.each([
+    ['a successful reply', (request) => request.resolve(fakeEnvelope())],
+    ['a backend success: false reply', (request) => request.resolve({
+      success: false,
+      error: { code: 'INTERNAL_ERROR', message: 'Oops, something went wrong on the server.' },
+      messages: [],
+      context: null,
+      meta: { schemaVersion: '1.0', requestId: null, timestamp: null },
+    })],
+    ['a transport error', (request) => request.reject(new TypeError('Failed to fetch'))],
+    ['a timeout', (request) => request.reject(new DOMException('The operation was aborted.', 'AbortError'))],
+  ])('after %s, focus returns to the composer', async (label, settle) => {
+    render(<Chatbot />);
+    const request = deferred();
+    callBackend.mockReturnValueOnce(request.promise);
+
+    const textarea = await sendWithEnterAndLoseFocus('What is a balanced diet?');
+    await act(async () => {
+      settle(request);
+    });
+
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+    expect(document.activeElement).toBe(textarea);
+    expect(callBackend).toHaveBeenCalledTimes(1);
+  });
+
+  test('a suggestion chip sends once, and focus returns to the composer after the reply', async () => {
+    render(<Chatbot />);
+    callBackend.mockResolvedValueOnce({
+      ...fakeEnvelope(),
+      messages: [{ type: 'text', content: { text: 'Anything else?' }, suggestions: [{ id: 'more', label: 'Tell me more', value: 'Tell me more' }] }],
+    });
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'What is a balanced diet?' } });
+    fireEvent.submit(textarea.closest('form'));
+
+    const chip = await screen.findByRole('button', { name: 'Tell me more' });
+    const request = deferred();
+    callBackend.mockReturnValueOnce(request.promise);
+    chip.focus();
+    fireEvent.click(chip);
+
+    // The chip belonged to the previous reply, so it is removed and focus is lost.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Tell me more' })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(document.body);
+    await act(async () => {
+      request.resolve(fakeEnvelope());
+    });
+
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+    expect(document.activeElement).toBe(textarea);
+    expect(callBackend).toHaveBeenCalledTimes(2);
+    expect(callBackend).toHaveBeenLastCalledWith('General FAQ', { message: 'Tell me more' });
+  });
+
+  test('focus moved to another control while waiting is not taken back', async () => {
+    render(<><Chatbot /><button type="button">Elsewhere</button></>);
+    const request = deferred();
+    callBackend.mockReturnValueOnce(request.promise);
+    await sendWithEnterAndLoseFocus('What is a balanced diet?');
+
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => elsewhere.focus());
+    await act(async () => {
+      request.resolve(fakeEnvelope());
+    });
+
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  test('the composer is not focused when the chat first renders', () => {
+    render(<Chatbot />);
+    expect(document.activeElement).not.toBe(screen.getByRole('textbox'));
+  });
+});

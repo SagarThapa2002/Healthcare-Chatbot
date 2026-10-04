@@ -1,4 +1,6 @@
-function ChatComposer({ value, onChange, onSubmit, disabled }) {
+// `inputRef`, if given, is attached to the textarea (ChatPanel uses it to
+// return focus here after a reply).
+function ChatComposer({ value, onChange, onSubmit, disabled, inputRef }) {
   const canSend = value.trim().length > 0 && !disabled;
 
   const handleKeyDown = (e) => {
@@ -17,6 +19,7 @@ function ChatComposer({ value, onChange, onSubmit, disabled }) {
           Message
         </label>
         <textarea
+          ref={inputRef}
           id="chat-message-input"
           name="message"
           rows={1}
